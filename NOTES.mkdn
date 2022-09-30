@@ -1,0 +1,171 @@
+Unusual requirements:
+
+- The LPC55 has one sector size for both program and erase. It does not appear
+  to be willing to program a smaller unit than 512 B. On the up side, the erase
+  sectors are 512 B.
+
+- The STM32H7 has giant (128 kiB) erase sectors and tiny (32 B) write sectors.
+
+
+---
+
+The on-disk representation of the filesystem is a _log,_ containing things
+called _entries._ Stored objects are one kind of entry, called a _KV entry_ (for
+key-value).
+
+Each entry consists of a stream of bytes, padded to a whole number of write
+sectors. The stream of bytes consists of:
+
+- A generic entry header.
+- A type-specific subheader.
+- Any data contents.
+- Padding.
+- A type-specific subtrailer.
+- A generic entry trailer.
+
+Padding is between the contents and the trailers for reasons that will become
+apparent shortly.
+
+To write an entry, begin programming at the first sector moving toward the end.
+
+An entry is complete when its trailer sector finishes programming.
+
+An incomplete entry may occur if we lose power or crash before we're done
+programming the entry. You can detect an incomplete entry by comparing the
+header (which is written first) with the trailer (which is written last); if
+they don't match, the entry is incomplete. Because unwritten areas are expected
+to be detectable as blank (either because they fail ECC, or because they read as
+a predictable bit pattern), a blank trailer is also a clear indication of an
+incomplete entry. (There's also a special type code used to mark incomplete
+entries, below.)
+
+A incomplete entry _must still be treated as being in the log_ for space
+allocation purposes: detecting it as incomplete _requires_ that its trailing
+sector stay unused. However, it will not be treated as valid for lookup or
+garbage collection.
+
+
+The log has a _watermark_ indicating the break between valid/used data and
+invalid/free data. To recover this watermark on restart,
+
+- Begin reading from the log at the beginning.
+- Skip each entry that is found.
+- If an entry is incomplete, the watermark immediately follows its unwritten
+  trailer sector.
+- If the sector after an entry (which would normally be the header of the
+  following entry) is blank, set the watermark there.
+- If you run into the end of the allocated space, then there is no free space
+  and the watermark is at the end of the space.
+
+On restart, if an incomplete entry is detected, we _program its trailer_ to
+indicate incompleteness and enable it to be skipped when reading the log in
+reverse. A special trailer type code is reserved to indicate an incomplete
+entry. The header is not modified, because of medium restrictions.
+
+
+The generic header contains:
+
+- A type indicator, giving the nature of the subheader
+    - The all-1s and all-0s type indicators are both reserved.
+- Offset, in sectors, to sector containing the trailer. This allows an entry to
+  be checked and skipped in a generic fashion without parsing subheaders.
+- A checksum, to make it less likely that arbitrary data is confused for a
+  header.
+
+The generic trailer contains the same information. Trailers use different type
+codes from headers so they can't be confused for one another.
+
+
+The KV entry subheader contains:
+
+- Length of the key, in bytes
+- A cheaply computed hash of the key. This is not for integrity protection (we
+  assume ECC on the underlying medium) but for fast lookup: if the length and
+  hash don't match, there's no need to read the key.
+
+The subtrailer is identical.
+
+
+To find the latest KV entry for a key:
+
+- Start at the watermark (end of the log).
+- Repeat until you run out of log:
+    - Read the sector that should contain the trailer. This read can be
+      performed without blank-check because of the "write incomplete trailer on
+      startup" behavior described above.
+    - If it is relevant (type code is KV trailer, subtrailer key length and hash
+      are correct), do a bytewise compare of the key contents. If that matches,
+      we've found our entry.
+    - Otherwise, skip it.
+
+This algorithm is worst-case linear in the total number of modifications that
+have been performed to the log since last GC. It uses no RAM beyond the
+watermark value and iteration state.
+
+
+An extension of that algorithm would maintain a cache of key hashes and record
+locations to move reads of at least frequently-used entries toward O(1). It
+would still have O(n) worst case performance.
+
+
+We could also define an entry that contains a key hash table, which would let us
+periodically "checkpoint" the filesystem and preserve fast access. If this
+hashtable is comprehensive, it also serves as an index of all valid previous
+entries and could accelerate GC.
+
+
+On GC, we want to copy only the _latest_ version of each entry. This discussion
+will focus on KV entries since they're the main one. Adding new entry forms may
+require GC alterations.
+
+- Start at the watermark and work backwards, like a lookup.
+- If an entry is incomplete, skip it.
+- Check if a later version of the entry has already been written.
+    - Look up against the tracking structure.
+    - If the tracking structure is inconclusive, do a lookup against the
+      partially written target.
+- Otherwise, copy it into the new space. A bitwise copy will suffice, since all
+  internal data is expressed in relative offsets.
+- Record its key in a tracking data structure
+    - Probably use a bloom filter to track "possibly already written"
+    - Probably also use a bounded-size hash table mapping key hashes to offsets
+      within the target space.
+
+This is potentially n^2 if the tracking structure is too small: every update
+would require scanning all previous updates. Can I avoid this?
+
+
+
+Deleting an entry requires a new _delete_ entry. The alterations to the logic
+above that are required for handling deletes are:
+
+- On lookup, if a delete entry for a given key is found, report that the entry
+  is missing.
+- On GC, delete entries do not get written to the target space, but _do_ get
+  added to the tracking structure.
+    - Note: this strongly suggests that the "have I copied this" scan needs to
+      be on the processed portion of from-space, not to-space.
+- 
+
+---
+
+If basic checks succeed and there is an unambiguously current space, we can
+mount read-only.
+
+Barriers to mounting read-write include:
+
+- Incomplete entry with blank trailer sector. Would not be able to be skipped
+  during backwards seek. Needs to have trailer sector written.
+- Unerased idle space. Would not be able to GC. Needs to be erased.
+
+A failure should only leave a _single_ incomplete entry at the end. Before
+another entry can be generated, it must be mounted read-write; for that to
+happen, the incomplete entry needs a filled in trailer sector, converting it to
+a waste entry.
+
+Because we require the other space to be erased before mounting read-write, we
+shouldn't be able to find it unerased _and also_ an incomplete entry. However,
+the process for correcting this situation seems quite clear; fix either problem
+in either order.
+
+

@@ -1,0 +1,51 @@
+# Key-value store proposal
+
+For storage of persistent information and encrypted data on the RoT, I propose a
+simple key-value store, written in safe Rust.
+
+Bullet points (good and bad):
+
+- Stores associations between keys (sequences of bytes) and values (other
+  sequences of bytes).
+- The current value can be looked up for a given key.
+- Values can be replaced, or the key-value pair deleted.
+- Can work on both direct-addressable (internal or memory-mapped) flash and
+  non-addressable flash (e.g. SPI).
+- Can operate without much state in RAM, at the cost of potentially O(number of
+  keys) lookups. Can also operate with RAM hashtables to accelerate this, with
+  adjustable cost. (Tunable.)
+- Can record index information in flash, making future lookups constant-time
+  without a RAM hashtable, at the cost of storage space. (Tunable.)
+- Resilient against crashes during updates.
+- Resilient against power failure during updates.
+- Supports atomic in-place version upgrades by hijacking the garbage collection
+  process.
+- Can be mounted read-only for inspection by tools despite various forms of
+  corruption.
+- Available as a portable lib crate for use in tests and tools.
+- Writes are typically O(1) but are worst-case O(number of entries in the store)
+  if garbage collection is required.
+- Keeps half of flash in reserve for garbage collection, so a data store
+  spanning 10 kiB can only store slightly less than 5 kiB of data.
+
+Assumptions (these appear to hold for our likely targets):
+
+- Flash is writable in units we'll call "sectors," which are at least 16 bytes.
+- Sector writes are atomic.
+- A sector must be erased to be written, and can be written once per erase.
+- Erase takes more time than writing and affects many sectors at once.
+- It is possible to tell if a sector can be written (has been erased) without
+  hardware faults.
+- It is possible to tell if a sector can be read (has been written since erase)
+  without hardware faults.
+- The flash has integrity protection using out-of-band information such as ECC
+  bits per sector.
+- A failure during sector erase will either leave the sector erased, unchanged,
+  or with invalid out-of-band information that makes it detectable as corrupt,
+  but will never make up apparently valid data.
+
+Non-assumptions:
+
+- Does not rely on any clever flash behaviors like multiply programming pages.
+- Does not make assumptions about the contents of erased memory.
+

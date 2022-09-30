@@ -1,0 +1,20 @@
+[package]
+name = "sketch1"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = {version = "1.4.3", default-features = false}
+crc = { version = "3.0.0", default-features = false }
+fnv = {version = "1.0.7", default-features = false}
+num-derive = "0.3.3"
+num-traits = {version = "0.2.15", default-features = false}
+zerocopy = {version = "0.6.1", default-features = false}
+
+[dev-dependencies]
+pretty-hex = "0.3.0"
+clap = {version = "3", features = ["derive"]}
+rustyline = "10.0.0"
+anyhow = "1.0.65"
