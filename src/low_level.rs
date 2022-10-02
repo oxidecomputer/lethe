@@ -4,24 +4,45 @@ use core::borrow::{Borrow, BorrowMut};
 use zerocopy::{AsBytes, FromBytes, Unaligned};
 use num_traits::FromPrimitive;
 
+/// Shorthand for a `u16` in little-endian representation.
 type U16LE = zerocopy::U16<byteorder::LittleEndian>;
+/// Shorthand for a `u32` in little-endian representation.
 type U32LE = zerocopy::U32<byteorder::LittleEndian>;
 
+/// Header written to the start of a formatted space, to mark it as such.
+///
+/// This will appear at the start of the first sector in a space. We take care
+/// to write this sector _last_ so that this header only appears on fully
+/// initialized spaces.
 #[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned)]
 #[repr(C)]
 pub struct SpaceHeader {
+    /// Magic number (`EXPECTED_MAGIC`) distinguishing this from arbitrary data.
     pub magic: U32LE,
+    /// Generation number (sequence number) of this space. This is used to
+    /// tie-break if we find both spaces initialized.
     pub generation: U32LE,
+    /// Base 2 logarithm of the sector size. This is used as a check to ensure
+    /// that the implementation has been correctly configured for the space.
     pub l2_sector_size: u8,
+    /// Reserved padding bytes, must be zero.
     pub pad: [u8; 3],
+    /// CRC32 of the above data, in order. Used to be doubly sure this isn't
+    /// arbitrary data.
     pub crc: U32LE,
 }
 
 impl SpaceHeader {
+    /// Bits we expect to find in the `magic` field. (This is a random number.)
     pub const EXPECTED_MAGIC: u32 = 0x53_be_88_9f;
+    /// Smallest practical sector size (16 bytes).
     pub const MIN_L2_SECTOR_SIZE: u8 = 4;
+    /// Largest halfway-reasonable sector size (1 GiB).
     pub const MAX_L2_SECTOR_SIZE: u8 = 30;
 
+    /// Basic internal integrity check of the header. Checks fields against
+    /// static ranges and verifies the magic and CRC. This doesn't know the
+    /// sector size you're expecting, so you'll need to check that separately.
     pub fn check(&self) -> bool {
         self.magic.get() == Self::EXPECTED_MAGIC
             && self.l2_sector_size >= Self::MIN_L2_SECTOR_SIZE
@@ -30,6 +51,7 @@ impl SpaceHeader {
             && self.crc_valid()
     }
 
+    /// Compute the _expected_ CRC given all the other contents of `self`.
     pub fn expected_crc(&self) -> u32 {
         let algo = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
         let mut digest = algo.digest();
@@ -41,6 +63,7 @@ impl SpaceHeader {
         digest.finalize()
     }
 
+    /// Checks if the CRC field correctly describes the other fields in `self`.
     pub fn crc_valid(&self) -> bool {
         self.crc.get() == self.expected_crc()
     }
@@ -64,6 +87,7 @@ pub struct EntryHeader {
 }
 
 impl EntryHeader {
+    /// Bits we expect to find in the `magic` field.
     pub const EXPECTED_MAGIC: u16 = 0xCB_F5;
 }
 
