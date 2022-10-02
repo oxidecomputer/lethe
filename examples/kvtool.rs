@@ -145,62 +145,38 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             }
         }
         Cmd::Write { key, value } => {
-            let mut buffers = sketch1::StoreBuffers {
-                b0: [0; S],
-                b1: [0; S],
-            };
-            let store = match sketch1::mount(img, &mut buffers) {
-                Err(e) => bail!("could not mount: {:?}", e.cause()),
-                Ok(store) => store,
-            };
-
-            if !store.can_mount_writable() {
-                bail!("can't mount store writable due to errors");
-            }
-
-            let mut store = store.mount_writable().map_err(|_| ()).unwrap();
-
-            use sketch1::low_level::WriteError;
-            match store.write_kv(key.as_bytes(), value.as_bytes()) {
-                Ok(()) => println!("ok"),
-                Err(WriteError::NoSpace) => println!("no space"),
-                Err(e) => println!("error: {e:?}"),
-            }
+            with_writable_mounted_image(img, |mut store| {
+                use sketch1::low_level::WriteError;
+                match store.write_kv(key.as_bytes(), value.as_bytes()) {
+                    Ok(()) => println!("ok"),
+                    Err(WriteError::NoSpace) => println!("no space"),
+                    Err(e) => println!("error: {e:?}"),
+                }
+                Ok(())
+            })?;
         }
         Cmd::Locate { key } => {
-            let mut buffers = sketch1::StoreBuffers {
-                b0: [0; S],
-                b1: [0; S],
-            };
-            match sketch1::mount(img, &mut buffers) {
-                Err(e) => bail!("could not mount: {:?}", e.cause()),
-                Ok(mut store) => {
-                    match store.locate_kv(key.as_bytes()) {
-                        Ok(Some(x)) => println!("found at sector {x}"),
-                        Ok(None) => println!("not found"),
-                        Err(e) => println!("error: {e:?}"),
-                    }
+            with_mounted_image(img, |store| {
+                match store.locate_kv(key.as_bytes()) {
+                    Ok(Some(x)) => println!("found at sector {x}"),
+                    Ok(None) => println!("not found"),
+                    Err(e) => println!("error: {e:?}"),
                 }
-            }
+                Ok(())
+            })?;
         }
         Cmd::Read { key } => {
-            let mut buffers = sketch1::StoreBuffers {
-                b0: [0; S],
-                b1: [0; S],
-            };
-            match sketch1::mount(img, &mut buffers) {
-                Err(e) => bail!("could not mount: {:?}", e.cause()),
-                Ok(mut store) => {
-                    let mut out = [0; 1024];
-                    match store.read_kv(key.as_bytes(), &mut out) {
-                        Ok(Some(n)) => {
-                            println!("{}", pretty_hex::pretty_hex(&&out[..n]));
-                        }
-                        Ok(None) => println!("not found"),
-                        Err(e) => println!("error: {e:?}"),
+            with_mounted_image(img, |store| {
+                let mut out = [0; 1024];
+                match store.read_kv(key.as_bytes(), &mut out) {
+                    Ok(Some(n)) => {
+                        println!("{}", pretty_hex::pretty_hex(&&out[..n]));
                     }
+                    Ok(None) => println!("not found"),
+                    Err(e) => println!("error: {e:?}"),
                 }
-            }
+                Ok(())
+            })?;
         }
         Cmd::Dump { space } => {
             let space = Space::from(space);
@@ -321,7 +297,7 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             println!("evacuating contents of space {:?} => {:?}",
                 space, space.other());
 
-            let r = sketch1::low_level::evacuate(
+            sketch1::low_level::evacuate(
                 &mut img,
                 &mut buffer0,
                 &mut buffer1,
@@ -329,13 +305,43 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                 end,
             ).map_err(|e| {
                 anyhow!("flash access error: {e:?}")
-            });
+            })?;
 
             println!("done");
         }
     }
 
     Ok(())
+}
+
+fn with_mounted_image<const S: usize>(
+    img: FlashImage<S>,
+    body: impl FnOnce(sketch1::Store<'_, FlashImage<S>>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut buffers = sketch1::StoreBuffers {
+        b0: [0; S],
+        b1: [0; S],
+    };
+    let store = match sketch1::mount(img, &mut buffers) {
+        Err(e) => bail!("could not mount: {:?}", e.cause()),
+        Ok(store) => store,
+    };
+
+    body(store)
+}
+
+fn with_writable_mounted_image<const S: usize>(
+    img: FlashImage<S>,
+    body: impl FnOnce(sketch1::WritableStore<'_, FlashImage<S>>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_mounted_image(img, |store| {
+        if !store.can_mount_writable() {
+            bail!("can't mount store writable due to errors");
+        }
+
+        let store = store.mount_writable().map_err(|_| ()).unwrap();
+        body(store)
+    })
 }
 
 struct FlashImage<const S: usize> {
