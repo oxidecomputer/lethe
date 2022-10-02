@@ -541,6 +541,10 @@ pub enum ReadError<E> {
     BadMagic(u32),
     BadSubBytes(u32),
     BadLength(u32),
+
+    // TODO: probably doesn't belong in low_level
+    End(u32),
+
     Flash(E),
 }
 

@@ -101,11 +101,17 @@ impl<F: Flash> Store<'_, F> {
         )
     }
 
+    // TODO this should not be in the high level interface since it allows
+    // arbitrary sector reads
     pub fn read_contents(
         &self,
         head_sector: u32,
-        value_out: &mut [u8],
-    ) -> Result<Option<usize>, low_level::ReadError<F::Error>> {
+        offset: u32,
+        out: &mut [u8],
+    ) -> Result<usize, low_level::ReadError<F::Error>> {
+        // Read the head sector. (TODO: in the case where we're being called by
+        // read_kv this is technically unnecessary; provide a path that can
+        // reuse the trailer metadata that function has already read.)
         let mut b = self.buffers.borrow_mut();
         let entry = low_level::read_entry_from_head(
             &self.flash,
@@ -113,36 +119,55 @@ impl<F: Flash> Store<'_, F> {
             self.current,
             head_sector,
         )?;
-        let value_len = entry.meta.contents_length.get() as usize;
 
-        if value_len > value_out.len() {
-            return Ok(Some(value_len));
-        }
+        // Work out the actual shape of the read.
+        let overall_len = entry.meta.contents_length.get();
+        // Allow the offset to be anywhere up to the end; reject offsets beyond
+        // that as errors. Compute the remaining length past our offset.
+        let offset_len = overall_len.checked_sub(offset)
+            .ok_or(low_level::ReadError::End(overall_len))?;
+        // We'll read all of the remaining contents, or as much as will fit into
+        // `out`, whichever is shorter.
+        let read_size = usize::min(offset_len as usize, out.len());
+        let mut out = &mut out[..read_size];
 
+        // Adjust the offset to account for the entry header and submeta.
+        let mut offset = size_of::<low_level::EntryHeader>()
+            + entry.meta.sub_bytes as usize
+            + offset as usize;
+        // Work out our sector address given that offset.
         let mut sector = head_sector as usize;
-        let mut offset = size_of::<F::Sector>() + entry.meta.sub_bytes as usize;
-        let mut out = &mut value_out[..value_len];
 
+        // TODO given that sector size is compile-time constant this should
+        // probably become div/mod.
         while offset >= size_of::<F::Sector>() {
             offset -= size_of::<F::Sector>();
             sector += 1;
         }
 
+        // Transfer the data!
         while !out.is_empty() {
+            // Each time into this loop we need to read `sector`. For the first
+            // sector, `offset` will give a number of bytes to ignore; on
+            // subsequent sectors `offset` is zero.
+
             self.flash.read_sector(
                 self.current,
                 sector as u32,
                 &mut b.b0,
             )?;
 
-            let n = (size_of::<F::Sector>() - offset).min(value_len);
+            // Copy out the sector (less our offset) but allow for shorter
+            // copies on the final sector.
+            let n = usize::min(size_of::<F::Sector>() - offset, out.len());
             out[..n].copy_from_slice(&b.b0.borrow()[offset..offset + n]);
+
             offset = 0;
             sector += 1;
             out = &mut out[n..];
         }
 
-        Ok(Some(value_len))
+        Ok(read_size)
     }
 
     pub fn read_kv(
@@ -150,57 +175,20 @@ impl<F: Flash> Store<'_, F> {
         key: &[u8],
         value_out: &mut [u8],
     ) -> Result<Option<usize>, low_level::ReadError<F::Error>> {
-        let mut b = self.buffers.borrow_mut();
-        let loc = low_level::seek_kv_backwards(
-            &self.flash,
-            &mut b.b0,
-            self.current,
-            self.next_free,
-            key,
-        )?;
-
-        if let Some(head_sector) = loc {
-            let entry = low_level::read_entry_from_head(
+        let loc = {
+            // limit scope of borrow so that read_contents below can work
+            let mut b = self.buffers.borrow_mut();
+            low_level::seek_kv_backwards(
                 &self.flash,
                 &mut b.b0,
                 self.current,
-                head_sector,
-            )?;
-            let value_offset = size_of::<low_level::EntryHeader>()
-                + size_of::<low_level::DataSubHeader>()
-                + key.len();
-            let value_len = entry.meta.contents_length.get() as usize
-                - key.len();
+                self.next_free,
+                key,
+            )?
+        };
 
-            if value_len > value_out.len() {
-                return Ok(Some(value_len));
-            }
-
-            let mut sector = value_offset / size_of::<F::Sector>()
-                + head_sector as usize;
-            let mut offset = value_offset % size_of::<F::Sector>();
-            let mut out = &mut value_out[..value_len];
-
-            while offset >= size_of::<F::Sector>() {
-                offset -= size_of::<F::Sector>();
-                sector += 1;
-            }
-
-            while !out.is_empty() {
-                self.flash.read_sector(
-                    self.current,
-                    sector as u32,
-                    &mut b.b0,
-                )?;
-
-                let n = (size_of::<F::Sector>() - offset).min(value_len);
-                out[..n].copy_from_slice(&b.b0.borrow()[offset..offset + n]);
-                offset = 0;
-                sector += 1;
-                out = &mut out[n..];
-            }
-
-            Ok(Some(value_len))
+        if let Some(head_sector) = loc {
+            Ok(Some(self.read_contents(head_sector, key.len() as u32, value_out)?))
         } else {
             Ok(None)
         }
