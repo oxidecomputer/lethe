@@ -226,7 +226,7 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
 
                 match kst {
                     Some(sketch1::low_level::KnownSubtypes::Data) | Some(sketch1::low_level::KnownSubtypes::Delete) => {
-                        let (subheader, _) = sketch1::low_level::cast_prefix::<sketch1::low_level::DataSubHeader>(entry.submeta);
+                        let (subheader, _) = sketch1::low_level::cast_prefix::<sketch1::low_level::DataSubMeta>(entry.submeta);
                         println!("- key hash {:#08x}", subheader.key_hash.get());
 
                         let mut key = vec![0; subheader.key_length.get() as usize];

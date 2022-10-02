@@ -71,7 +71,7 @@ impl SpaceHeader {
 
 #[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, Eq, PartialEq)]
 #[repr(C)]
-pub struct EntryHeader {
+pub struct EntryMeta {
     /// Marker to designate an entry header and help distinguish it from
     /// unprogrammed or random data.
     pub magic: U16LE,
@@ -86,7 +86,7 @@ pub struct EntryHeader {
     pub contents_length: U32LE,
 }
 
-impl EntryHeader {
+impl EntryMeta {
     /// Bits we expect to find in the `magic` field.
     pub const EXPECTED_MAGIC: u16 = 0xCB_F5;
 }
@@ -105,14 +105,14 @@ pub enum KnownSubtypes {
 
 #[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned)]
 #[repr(C)]
-pub struct DataSubHeader {
+pub struct DataSubMeta {
     /// Number of bytes in the key.
     pub key_length: U32LE,
     /// Hash of the key bytes using FNV-1, to assist in key lookup.
     pub key_hash: U32LE,
 }
 
-impl DataSubHeader {
+impl DataSubMeta {
     pub const SIZE: usize = size_of::<Self>();
     pub const SUB_BYTES: u8 = Self::SIZE as u8;
 }
@@ -128,7 +128,7 @@ fn hash_key(key: &[u8]) -> u32 {
     h as u32 ^ (h >> 32) as u32
 }
 
-pub type DeleteSubHeader = DataSubHeader;
+pub type DeleteSubMeta = DataSubMeta;
 
 pub trait Flash {
     type Sector: Sized + BorrowMut<[u8]> + Borrow<[u8]>;
@@ -583,7 +583,7 @@ pub(crate) fn seek_backwards<'b, F: Flash>(
     buffer: &'b mut F::Sector,
     current: Space,
     start_sector: u32,
-    mut filter: impl FnMut(&F, &mut F::Sector, u32, KnownSubHeaders) -> Result<EntryDecision, F::Error>,
+    mut filter: impl FnMut(&F, &mut F::Sector, u32, KnownSubMetas) -> Result<EntryDecision, F::Error>,
 ) -> Result<Option<u32>, ReadError<F::Error>> {
     let header_sectors = Constants::<F>::HEADER_SECTORS;
 
@@ -595,7 +595,7 @@ pub(crate) fn seek_backwards<'b, F: Flash>(
         let entry = read_entry_from_tail(flash, buffer, current, sector)?;
 
         let head_sector = entry.next_sector;
-        let ksh = KnownSubHeaders::new(entry.meta.subtype, entry.submeta);
+        let ksh = KnownSubMetas::new(entry.meta.subtype, entry.submeta);
 
         let r = filter(flash, buffer, head_sector, ksh)?;
         match r {
@@ -649,19 +649,19 @@ pub(crate) fn seek_kv_backwards<F: Flash>(
         start_sector,
         |flash, buffer, index, ksub| {
             match ksub {
-                KnownSubHeaders::Data(sub) | KnownSubHeaders::Delete(sub) => {
+                KnownSubMetas::Data(sub) | KnownSubMetas::Delete(sub) => {
                     // For these types, we want to check the key.
                     if sub.key_hash.get() == key_hash
                         && sub.key_length.get() == key_len
                     {
                         // A potential match!
-                        let meta_bytes = size_of::<EntryHeader>()
-                            + size_of::<DataSubHeader>();
+                        let meta_bytes = size_of::<EntryMeta>()
+                            + size_of::<DataSubMeta>();
                         let key_eq = flash.compare_contents(current, buffer, index, meta_bytes as u32, key)?;
                         if key_eq {
                             // Now, the difference between Data and Delete comes
                             // into play.
-                            if matches!(ksub, KnownSubHeaders::Data(_)) {
+                            if matches!(ksub, KnownSubMetas::Data(_)) {
                                 return Ok(EntryDecision::Accept)
                             } else {
                                 // A delete entry causes us to early-abort with no
@@ -681,14 +681,14 @@ pub(crate) fn seek_kv_backwards<F: Flash>(
 }
 
 #[derive(Copy, Clone, Debug)]
-pub enum KnownSubHeaders {
-    Data(DataSubHeader),
-    Delete(DeleteSubHeader),
+pub enum KnownSubMetas {
+    Data(DataSubMeta),
+    Delete(DeleteSubMeta),
     Aborted,
     Other(u8),
 }
 
-impl KnownSubHeaders {
+impl KnownSubMetas {
     pub fn new(subtype: u8, submeta: &[u8]) -> Self {
         match KnownSubtypes::from_u8(subtype) {
             Some(KnownSubtypes::Data) => Self::Data(*cast_prefix(submeta).0),
@@ -702,7 +702,7 @@ impl KnownSubHeaders {
 #[derive(Copy, Clone, Debug)]
 pub struct EntryInfo<'a> {
     pub next_sector: u32,
-    pub meta: &'a EntryHeader,
+    pub meta: &'a EntryMeta,
     pub submeta: &'a [u8],
 }
 
@@ -721,16 +721,16 @@ pub(crate) fn read_entry_from_tail<'b, F: Flash>(
 
     flash.read_sector(current, sector, buffer)?;
     let data = (*buffer).borrow();
-    let (data, meta) = cast_suffix::<EntryHeader>(data);
+    let (data, meta) = cast_suffix::<EntryMeta>(data);
 
-    if meta.magic.get() != EntryHeader::EXPECTED_MAGIC {
+    if meta.magic.get() != EntryMeta::EXPECTED_MAGIC {
         return Err(ReadError::BadMagic(sector));
     }
     let submeta_start = data.len().checked_sub(usize::from(meta.sub_bytes))
         .ok_or(ReadError::BadSubBytes(sector))?;
     let submeta = &data[submeta_start..];
 
-    let meta_bytes = size_of::<EntryHeader>() as u32
+    let meta_bytes = size_of::<EntryMeta>() as u32
         + u32::from(meta.sub_bytes);
 
     let entry_length = 2 * meta_bytes + meta.contents_length.get();
@@ -760,8 +760,8 @@ pub fn read_contents<F: Flash>(
         current,
         head_sector,
     )?;
-    let value_offset = size_of::<EntryHeader>()
-        + size_of::<DataSubHeader>()
+    let value_offset = size_of::<EntryMeta>()
+        + size_of::<DataSubMeta>()
         + offset as usize;
     assert!(offset <= entry.meta.contents_length.get(),
         "can't read at offset {offset} into data of size {}",
@@ -805,15 +805,15 @@ pub fn read_entry_from_head<'b, F: Flash>(
 ) -> Result<EntryInfo<'b>, ReadError<F::Error>> {
     flash.read_sector(current, sector, buffer)?;
     let data = (*buffer).borrow();
-    let (meta, data) = cast_prefix::<EntryHeader>(data);
+    let (meta, data) = cast_prefix::<EntryMeta>(data);
 
-    if meta.magic.get() != EntryHeader::EXPECTED_MAGIC {
+    if meta.magic.get() != EntryMeta::EXPECTED_MAGIC {
         return Err(ReadError::BadMagic(sector));
     }
     let submeta = data.get(..usize::from(meta.sub_bytes))
         .ok_or(ReadError::BadSubBytes(sector))?;
 
-    let meta_bytes = size_of::<EntryHeader>() as u32
+    let meta_bytes = size_of::<EntryMeta>() as u32
         + u32::from(meta.sub_bytes);
 
     let entry_length = 2 * meta_bytes + meta.contents_length.get();
@@ -842,13 +842,13 @@ pub(crate) fn write_kv<F: Flash>(
     let contents_length = key_len.checked_add(value_len)
         .expect("key+value too long");
 
-    let header = EntryHeader {
-        magic: EntryHeader::EXPECTED_MAGIC.into(),
+    let header = EntryMeta {
+        magic: EntryMeta::EXPECTED_MAGIC.into(),
         subtype: KnownSubtypes::Data as u8,
-        sub_bytes: DataSubHeader::SUB_BYTES,
+        sub_bytes: DataSubMeta::SUB_BYTES,
         contents_length: contents_length.into(),
     };
-    let subheader = DataSubHeader {
+    let subheader = DataSubMeta {
         key_length: key_len.into(),
         key_hash: hash_key(key).into(),
     };
@@ -973,7 +973,7 @@ pub fn evacuate<F: Flash>(
     while from_sector > header_sectors {
         let entry = read_entry_from_tail(flash, buffer0, from_space, from_sector)?;
 
-        let meta_bytes = size_of::<EntryHeader>() as u32
+        let meta_bytes = size_of::<EntryMeta>() as u32
             + u32::from(entry.meta.sub_bytes);
         let entry_bytes = 2 * meta_bytes
             + entry.meta.contents_length.get();
@@ -993,7 +993,7 @@ pub fn evacuate<F: Flash>(
                 // probably always need to be able to fall back to scanning the
                 // in-progress to-space data structure for a match.
 
-                let (_, subtrailer) = cast_suffix::<DataSubHeader>(entry.submeta);
+                let (_, subtrailer) = cast_suffix::<DataSubMeta>(entry.submeta);
                 let key_hash = subtrailer.key_hash.get();
                 let key_len = subtrailer.key_length.get();
 
@@ -1004,7 +1004,7 @@ pub fn evacuate<F: Flash>(
                     to_sector,
                     |flash, buf, s, sub| {
                         match sub {
-                            KnownSubHeaders::Data(sub) | KnownSubHeaders::Delete(sub) => {
+                            KnownSubMetas::Data(sub) | KnownSubMetas::Delete(sub) => {
                                 if sub.key_hash.get() == key_hash
                                     && sub.key_length.get() == key_len
                                 {
@@ -1365,7 +1365,7 @@ mod tests {
         //  18  magic, subtype, sub_bytes
         //  1C  contents_length
         let mut sec1 = [0; 32];
-        sec1[0..=1].copy_from_slice(&EntryHeader::EXPECTED_MAGIC.to_le_bytes());
+        sec1[0..=1].copy_from_slice(&EntryMeta::EXPECTED_MAGIC.to_le_bytes());
         sec1[2] = 0xAA;
         sec1[3] = 4;
         sec1[4..=7].copy_from_slice(&8_u32.to_le_bytes());
@@ -1376,7 +1376,7 @@ mod tests {
 
         sec1[0x14..=0x17].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
 
-        sec1[0x18..=0x19].copy_from_slice(&EntryHeader::EXPECTED_MAGIC.to_le_bytes());
+        sec1[0x18..=0x19].copy_from_slice(&EntryMeta::EXPECTED_MAGIC.to_le_bytes());
         sec1[0x1A] = 0xAA;
         sec1[0x1B] = 4;
         sec1[0x1C..=0x1F].copy_from_slice(&8_u32.to_le_bytes());
@@ -1393,8 +1393,8 @@ mod tests {
             2,
         ).expect("entry should pass read validation");
 
-        assert_eq!(entry_info.meta, &EntryHeader {
-            magic: EntryHeader::EXPECTED_MAGIC.into(),
+        assert_eq!(entry_info.meta, &EntryMeta {
+            magic: EntryMeta::EXPECTED_MAGIC.into(),
             subtype: 0xAA,
             sub_bytes: 4,
             contents_length: 8.into(),

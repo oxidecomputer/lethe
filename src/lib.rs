@@ -132,7 +132,7 @@ impl<F: Flash> Store<'_, F> {
         let mut out = &mut out[..read_size];
 
         // Adjust the offset to account for the entry header and submeta.
-        let mut offset = size_of::<low_level::EntryHeader>()
+        let mut offset = size_of::<low_level::EntryMeta>()
             + entry.meta.sub_bytes as usize
             + offset as usize;
         // Work out our sector address given that offset.
