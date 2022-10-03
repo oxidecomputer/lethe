@@ -2,9 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use core::mem::size_of;
 use clap::Parser;
-use anyhow::{Context, Error, anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use std::io::{Seek, Read, Write, SeekFrom};
 use std::cell::RefCell;
 use num_traits::FromPrimitive;
@@ -442,7 +441,7 @@ impl<const S: usize> sketch1::low_level::Flash for FlashImage<S> {
         Ok(b.iter().all(|&byte| byte == 0xFF))
     }
 
-    fn can_read_sector(&self, space: Space, index: u32) -> Result<bool, Self::Error> {
+    fn can_read_sector(&self, _space: Space, _index: u32) -> Result<bool, Self::Error> {
         // This backend allows arbitrary reads.
         Ok(true)
     }
