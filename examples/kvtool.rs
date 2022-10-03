@@ -7,7 +7,7 @@ use anyhow::{Context, anyhow, bail};
 use std::io::{Seek, Read, Write, SeekFrom};
 use std::cell::RefCell;
 use num_traits::FromPrimitive;
-use sketch1::low_level::Flash;
+use lethe::low_level::Flash;
 
 #[derive(Parser)]
 struct Kvtool {
@@ -111,13 +111,13 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             for space in Space::ALL {
                 println!("checking space {:?}", space);
 
-                let result = sketch1::low_level::check(
+                let result = lethe::low_level::check(
                     &mut img,
                     &mut buffer0,
                     space,
                 )?;
 
-                use sketch1::low_level::CheckResult;
+                use lethe::low_level::CheckResult;
                 match result {
                     CheckResult::ValidLog { generation, end, tail_erased, incomplete_write } => {
                         println!("- contains valid log of {end} sectors");
@@ -150,13 +150,13 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
         }
         Cmd::Format { space } => {
             println!("formatting space {space:?}");
-            let r = sketch1::low_level::format(
+            let r = lethe::low_level::format(
                 &mut img,
                 &mut buffer0,
                 space.into(),
                 0,
             );
-            use sketch1::low_level::FormatError;
+            use lethe::low_level::FormatError;
             match r {
                 Ok(()) => println!("success"),
                 Err(FormatError::NeedsErase) => {
@@ -169,7 +169,7 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
         }
         Cmd::Write { key, value } => {
             with_writable_mounted_image(img, |mut store| {
-                use sketch1::low_level::WriteError;
+                use lethe::low_level::WriteError;
                 match store.write_kv(key.as_bytes(), value.as_bytes()) {
                     Ok(()) => println!("ok"),
                     Err(WriteError::NoSpace) => println!("no space"),
@@ -203,13 +203,13 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
         }
         Cmd::Dump { space } => {
             let space = Space::from(space);
-            let result = sketch1::low_level::check(
+            let result = lethe::low_level::check(
                 &mut img,
                 &mut buffer0,
                 space,
             )?;
 
-            use sketch1::low_level::CheckResult;
+            use lethe::low_level::CheckResult;
             let end = match result {
                 CheckResult::ValidLog { end, .. } => {
                     end
@@ -222,11 +222,11 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             println!("dumping log contents from space {space:?}");
 
             let mut seen_keys = std::collections::HashMap::new();
-            let mut sector = sketch1::low_level::Constants::<FlashImage<S>>::HEADER_SECTORS;
+            let mut sector = lethe::low_level::Constants::<FlashImage<S>>::HEADER_SECTORS;
 
             while sector < end {
                 println!("entry at sector {sector}");
-                let entry = sketch1::low_level::read_entry_from_head(
+                let entry = lethe::low_level::read_entry_from_head(
                     &mut img,
                     &mut buffer0,
                     space,
@@ -234,7 +234,7 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                 ).map_err(|e| {
                     anyhow!("failed to read: {e:?}")
                 })?;
-                let kst = sketch1::low_level::KnownSubtypes::from_u8(entry.meta.subtype);
+                let kst = lethe::low_level::KnownSubtypes::from_u8(entry.meta.subtype);
                 let next_sector = entry.next_sector;
                 let contents_length = entry.meta.contents_length.get();
 
@@ -247,12 +247,12 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                     });
 
                 match kst {
-                    Some(sketch1::low_level::KnownSubtypes::Data) | Some(sketch1::low_level::KnownSubtypes::Delete) => {
-                        let (subheader, _) = sketch1::low_level::cast_prefix::<sketch1::low_level::DataSubMeta>(entry.submeta);
+                    Some(lethe::low_level::KnownSubtypes::Data) | Some(lethe::low_level::KnownSubtypes::Delete) => {
+                        let (subheader, _) = lethe::low_level::cast_prefix::<lethe::low_level::DataSubMeta>(entry.submeta);
                         println!("- key hash {:#08x}", subheader.key_hash.get());
 
                         let mut key = vec![0; subheader.key_length.get() as usize];
-                        sketch1::low_level::read_contents(
+                        lethe::low_level::read_contents(
                             &mut img,
                             &mut buffer0,
                             space,
@@ -268,12 +268,12 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                         }
                         println!("Key {}", pretty_hex::pretty_hex(&key));
 
-                        if kst == Some(sketch1::low_level::KnownSubtypes::Delete) {
+                        if kst == Some(lethe::low_level::KnownSubtypes::Delete) {
                             println!("- this entry deletes the key");
                         } else {
                             let value_len = contents_length - key.len() as u32;
                             let mut val = vec![0; value_len as usize];
-                            sketch1::low_level::read_contents(
+                            lethe::low_level::read_contents(
                                 &mut img,
                                 &mut buffer0,
                                 space,
@@ -299,13 +299,13 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
         }
         Cmd::Evacuate { space } => {
             let space = Space::from(space);
-            let result = sketch1::low_level::check(
+            let result = lethe::low_level::check(
                 &mut img,
                 &mut buffer0,
                 space,
             )?;
 
-            use sketch1::low_level::CheckResult;
+            use lethe::low_level::CheckResult;
             let end = match result {
                 CheckResult::ValidLog { end, .. } => {
                     end
@@ -318,7 +318,7 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             println!("evacuating contents of space {:?} => {:?}",
                 space, space.other());
 
-            sketch1::low_level::evacuate(
+            lethe::low_level::evacuate(
                 &mut img,
                 &mut buffer0,
                 &mut buffer1,
@@ -337,13 +337,13 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
 
 fn with_mounted_image<const S: usize>(
     img: FlashImage<S>,
-    body: impl FnOnce(sketch1::Store<'_, FlashImage<S>>) -> anyhow::Result<()>,
+    body: impl FnOnce(lethe::Store<'_, FlashImage<S>>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let mut buffers = sketch1::StoreBuffers {
+    let mut buffers = lethe::StoreBuffers {
         b0: [0; S],
         b1: [0; S],
     };
-    let store = match sketch1::mount(img, &mut buffers) {
+    let store = match lethe::mount(img, &mut buffers) {
         Err(e) => bail!("could not mount: {:?}", e.cause()),
         Ok(store) => store,
     };
@@ -353,7 +353,7 @@ fn with_mounted_image<const S: usize>(
 
 fn with_writable_mounted_image<const S: usize>(
     img: FlashImage<S>,
-    body: impl FnOnce(sketch1::WritableStore<'_, FlashImage<S>>) -> anyhow::Result<()>,
+    body: impl FnOnce(lethe::WritableStore<'_, FlashImage<S>>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     with_mounted_image(img, |store| {
         if !store.can_mount_writable() {
@@ -409,9 +409,9 @@ impl<const S: usize> FlashImage<S> {
     }
 }
 
-use sketch1::low_level::Space;
+use lethe::low_level::Space;
 
-impl<const S: usize> sketch1::low_level::Flash for FlashImage<S> {
+impl<const S: usize> lethe::low_level::Flash for FlashImage<S> {
     type Sector = [u8; S];
     type Error = std::io::Error;
 
