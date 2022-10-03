@@ -4,6 +4,9 @@ use core::borrow::{Borrow, BorrowMut};
 use zerocopy::{AsBytes, FromBytes, Unaligned};
 use num_traits::FromPrimitive;
 
+//////////////////////////////////////////////////////////////////////////////
+// At-rest layout.
+
 /// Shorthand for a `u16` in little-endian representation.
 type U16LE = zerocopy::U16<byteorder::LittleEndian>;
 /// Shorthand for a `u32` in little-endian representation.
@@ -69,18 +72,24 @@ impl SpaceHeader {
     }
 }
 
+/// Metadata record used to identify entries.
+///
+/// The metadata is written at both offset 0 in the first sector of the entry,
+/// and in the final bytes of the last sector, to ensure that the entry can be
+/// processed from either direction.
 #[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, Eq, PartialEq)]
 #[repr(C)]
 pub struct EntryMeta {
-    /// Marker to designate an entry header and help distinguish it from
+    /// Marker to designate an entry and help distinguish it from
     /// unprogrammed or random data.
     pub magic: U16LE,
-    /// Type of subheader.
+    /// Type of entry, and thus sub-meta. See the `KnownSubtypes` enum for
+    /// defined values.
     pub subtype: u8,
-    /// Length of subheader (or subtrailer, as their lengths must match) in
-    /// bytes.
+    /// Length of submeta in bytes. The length must be correct for the `subtype`
+    /// -- this is _not_ intended to support variable-length submeta.
     pub sub_bytes: u8,
-    /// Length of contents separating the subheader from subtrailer. This length
+    /// Length of contents separating the header from the trailer. This length
     /// is in bytes; the actual contents will be followed by enough padding to
     /// justify the subtrailer/trailer to the end of the sector.
     pub contents_length: U32LE,
@@ -91,18 +100,29 @@ impl EntryMeta {
     pub const EXPECTED_MAGIC: u16 = 0xCB_F5;
 }
 
+/// Defined values for the `EntryMeta::subtype` field.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, num_derive::FromPrimitive)]
 pub enum KnownSubtypes {
     // Note: 0 is reserved.
 
+    /// An entry containing stored data. The sub-header/trailer will use the
+    /// `DataSubMeta` format.
     Data = 0x01,
+    /// An entry that serves to delete a previous entry. Uses the
+    /// `DeleteSubMeta` format which happens to match data.
     Delete = 0x02,
 
+    /// An entry that was incompletely written before a restart (and then
+    /// repaired). Has no sub-header/trailer (length 0).
+    ///
+    /// `Aborted` is the only subtype that can appear in the trailer of an entry
+    /// whose header reports a different type.
     Aborted = 0xFE,
 
     // Note: 0xFF is reserved.
 }
 
+/// Sub-metadata used for Data entries, representing key-value pairs.
 #[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned)]
 #[repr(C)]
 pub struct DataSubMeta {
@@ -113,13 +133,16 @@ pub struct DataSubMeta {
 }
 
 impl DataSubMeta {
+    /// Size of the sub-metadata, in bytes.
     pub const SIZE: usize = size_of::<Self>();
+    /// Same, but converted to `u8` for convenient use in the `sub_bytes` field.
     pub const SUB_BYTES: u8 = Self::SIZE as u8;
 }
 
-const KEY_HASH_KEY: u64 = 0;
+/// Computes the hash value corresponding to a particular key.
+pub fn hash_key(key: &[u8]) -> u32 {
+    const KEY_HASH_KEY: u64 = 0;
 
-fn hash_key(key: &[u8]) -> u32 {
     use core::hash::{Hash, Hasher};
 
     let mut hasher = fnv::FnvHasher::with_key(KEY_HASH_KEY);
@@ -128,18 +151,108 @@ fn hash_key(key: &[u8]) -> u32 {
     h as u32 ^ (h >> 32) as u32
 }
 
+/// Sub-metadata used for Delete entries.
 pub type DeleteSubMeta = DataSubMeta;
 
+
+//////////////////////////////////////////////////////////////////////////////
+// Flash device interface.
+
+/// Designates one of the two spaces in a flash device. This is like a ranged
+/// integer, or a bool with application-specific names.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Space {
+    Zero = 0,
+    One = 1,
+}
+
+impl Space {
+    /// Convenient array of all spaces.
+    pub const ALL: [Self; 2] = [Self::Zero, Self::One];
+
+    /// Given a space, get the _other_ one.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Zero => Self::One,
+            Self::One => Self::Zero,
+        }
+    }
+}
+
+impl From<Space> for usize {
+    fn from(s: Space) -> Self {
+        match s {
+            Space::Zero => 0,
+            Space::One => 1,
+        }
+    }
+}
+
+/// Trait describing flash memory for the purposes of our datastore.
 pub trait Flash {
+    /// Type of sector, which is typically a `[u8; N]` for some sector size `N`;
+    /// this is a type alias rather than a `const` because of restrictions on
+    /// the use of associated constants on type parameters in array sizes; see
+    /// `rust-lang/rust#43408`.
     type Sector: Sized + BorrowMut<[u8]> + Borrow<[u8]>;
+
+    /// Error type that can be produced during flash accesses.
     type Error;
 
+    /// Returns the number of sectors per space (of two spaces) in this device.
+    /// Note that this operation cannot fail; it's expected to be relatively
+    /// quick and always return the same result.
     fn sectors_per_space(&self) -> u32;
 
-    fn read_sector(&self, space: Space, index: u32, dest: &mut Self::Sector) -> Result<(), Self::Error>;
-    fn can_program_sector(&self, space: Space, index: u32) -> Result<bool, Self::Error>;
+    /// Reads sector `index` from `space` in the flash device, writing the data
+    /// into `dest`.
+    ///
+    /// On success, `dest` should be fully overwritten with data from the
+    /// device. On failure, you can leave `dest` partially or completely
+    /// untouched.
+    ///
+    /// Depending on the underlying device, `read_sector` may return an error
+    /// when applied to an erased sector, or may produce data.
+    fn read_sector(
+        &self,
+        space: Space,
+        index: u32,
+        dest: &mut Self::Sector,
+    ) -> Result<(), Self::Error>;
+
+    /// Checks whether sector `index` in `space` in the flash device can be
+    /// read. This is intended to signal that the sector has been programmed
+    /// since last being erased. However, some devices will freely read
+    /// erased-but-not-programmed sectors; for such devices, this function can
+    /// simply return `true`.
     fn can_read_sector(&self, space: Space, index: u32) -> Result<bool, Self::Error>;
-    fn program_sector(&mut self, space: Space, index: u32, data: &Self::Sector) -> Result<(), Self::Error>;
+
+    /// Checks whether sector `index` in `space` in the flash device can be
+    /// programmed (using `program_sector`). This is intended to check whether
+    /// the sector has been erased.
+    ///
+    /// For devices that support multiple overlapping writes per sector, this
+    /// should indicate whether the sector can be programmed _and then
+    /// faithfully read back the intended data,_ rather than (say)
+    /// bitwise-NANDing it with previous contents.
+    fn can_program_sector(
+        &self,
+        space: Space,
+        index: u32,
+    ) -> Result<bool, Self::Error>;
+
+    /// Writes `data` into sector `index` in `space` in the flash device.
+    ///
+    /// On success, the flash device _should_ report the same data from
+    /// `read_sector` until the sector is erased -- modulo hardware failures,
+    /// etc. On error, the sector _may or may not_ contain the data. It's
+    /// probably best to assume that it needs to be erased.
+    fn program_sector(
+        &mut self,
+        space: Space,
+        index: u32,
+        data: &Self::Sector,
+    ) -> Result<(), Self::Error>;
 
     /// Compares `data.len()` bytes starting at `offset` from the start of
     /// sector `index` for equality. `offset` may be larger than a sector, for
@@ -148,7 +261,19 @@ pub trait Flash {
     /// This is a "pushed compare" operation to take advantage of situations
     /// where we can do the compare without reading out every sector into RAM,
     /// such as directly-addressable flash.
-    fn compare_contents(&self, space: Space, buffer: &mut Self::Sector, mut index: u32, offset: u32, mut data: &[u8]) -> Result<bool, Self::Error> {
+    ///
+    /// The `buffer` argument is loaned to the driver, which may arbitrarily
+    /// scribble over its contents while doing the compare.
+    ///
+    /// The default implementation uses `read_sector`.
+    fn compare_contents(
+        &self,
+        space: Space,
+        buffer: &mut Self::Sector,
+        mut index: u32,
+        offset: u32,
+        mut data: &[u8],
+    ) -> Result<bool, Self::Error> {
         let sector_size = size_of::<Self::Sector>();
 
         let mut offset = offset as usize;
@@ -175,6 +300,14 @@ pub trait Flash {
         Ok(true)
     }
 
+    /// Compares two sequences of bytes in the flash device for equality. The
+    /// sequences start at a sector boundary but can be any byte length, and do
+    /// not need to be in the same space.
+    ///
+    /// This is a "pushed compare" operation for cases where the flash device
+    /// can compare sequences of bytes with fewer copies.
+    ///
+    /// The default implementation uses `read_sector`.
     fn compare_internal(
         &self,
         space0: Space,
@@ -206,6 +339,12 @@ pub trait Flash {
         Ok(true)
     }
 
+    /// Copies a sequence of sectors from `from_space`/`from_sector` to
+    /// `to_sector` in the other space.
+    ///
+    /// Drivers that can do a flash-to-flash copy without needing to copy all
+    /// the data through RAM can implement this to do so. The default
+    /// implementation uses `read_sector`/`program_sector`.
     fn copy_across(
         &mut self,
         from_space: Space,
@@ -226,6 +365,16 @@ pub trait Flash {
     }
 }
 
+/// Handy routine for converting a byte length to a sector count (rounded up) on
+/// a given flash device.
+///
+/// Note: this is not `const` merely because of limitations on the use of trait
+/// bounds in `const fn` at the time of this writing.
+pub fn bytes_to_sectors<F: Flash>(x: u32) -> u32 {
+    let sector_size = size_of::<F::Sector>() as u32;
+    (x + sector_size - 1) / sector_size
+}
+
 pub struct Constants<F>(PhantomData<F>);
 
 impl<F: Flash> Constants<F> {
@@ -235,42 +384,13 @@ impl<F: Flash> Constants<F> {
     };
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Space {
-    Zero = 0,
-    One = 1,
-}
-
-impl Space {
-    pub const ALL: [Self; 2] = [Self::Zero, Self::One];
-
-    pub fn other(self) -> Self {
-        match self {
-            Self::Zero => Self::One,
-            Self::One => Self::Zero,
-        }
-    }
-}
-
-impl From<Space> for usize {
-    fn from(s: Space) -> Self {
-        match s {
-            Space::Zero => 0,
-            Space::One => 1,
-        }
-    }
-}
-
-pub fn bytes_to_sectors<F: Flash>(x: u32) -> u32 {
-    let sector_size = size_of::<F::Sector>() as u32;
-    (x + sector_size - 1) / sector_size
-}
-
-
 /// Creates a new empty log in device `flash` and space `current`.
 ///
 /// This requires that the space has been erased. If it has not been erased,
 /// this will fail with `FormatError::NeedsErase`.
+///
+/// Given an erased space, formatting is simply a matter of writing a valid
+/// space header, so this only winds up needing one sector write.
 pub fn format<F: Flash>(
     flash: &mut F,
     buffer: &mut F::Sector,
@@ -301,6 +421,7 @@ pub fn format<F: Flash>(
     Ok(())
 }
 
+/// Things that can go wrong with `format`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatError<E> {
     NeedsErase,
@@ -482,9 +603,6 @@ pub(crate) fn check_entry<F: Flash>(
         Err(_) => return Ok(CheckEntryResult::HeadCorrupt),
         Ok(entry) => entry,
     };
-
-    #[cfg(test)]
-    println!("{head_info:#?}");
 
     if flash.can_program_sector(current, head_info.next_sector - 1)? {
         return Ok(CheckEntryResult::IncompleteWrite(head_info.next_sector));
