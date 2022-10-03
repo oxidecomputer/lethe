@@ -4,6 +4,7 @@ use anyhow::{Context, Error, anyhow, bail};
 use std::io::{Seek, Read, Write, SeekFrom};
 use std::cell::RefCell;
 use num_traits::FromPrimitive;
+use sketch1::low_level::Flash;
 
 #[derive(Parser)]
 struct Kvtool {
@@ -114,15 +115,7 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
         Cmd::Erase { space } => {
             println!("erasing space {space:?}");
             let space = Space::from(space);
-            let global_sector = usize::from(space) as u64 * img.sectors_per_space as u64;
-            let global_offset = global_sector * S as u64;
-
-            let mut f = img.file.borrow_mut();
-            f.seek(SeekFrom::Start(global_offset))?;
-            let erased = [0xFF; S];
-            for _ in 0..img.sectors_per_space {
-                f.write_all(&erased)?;
-            }
+            img.erase_space(space)?;
         }
         Cmd::Format { space } => {
             println!("formatting space {space:?}");
@@ -420,6 +413,20 @@ impl<const S: usize> sketch1::low_level::Flash for FlashImage<S> {
 
         file.seek(SeekFrom::Start(global_offset))?;
         file.write_all(data)?;
+        Ok(())
+    }
+
+    fn erase_space(&mut self, space: Space) -> Result<(), Self::Error> {
+        let global_sector = usize::from(space) as u64 * self.sectors_per_space as u64;
+        let global_offset = global_sector * S as u64;
+
+        let mut file = self.file.borrow_mut();
+
+        file.seek(SeekFrom::Start(global_offset))?;
+        let data = [0xFF; S];
+        for _ in 0..self.sectors_per_space {
+            file.write_all(&data)?;
+        }
         Ok(())
     }
 }

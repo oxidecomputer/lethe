@@ -105,8 +105,69 @@ impl<'b, F: Flash> Store<'b, F> {
         Ok(WritableStore(self))
     }
 
+    /// Attempts to repair any issues that would prevent mounting the store
+    /// writable.
+    ///
+    /// On success, `can_mount_writable` will return `true`, and
+    /// `mount_writable` will succeed, modulo flash device failures.
     pub fn repair(&mut self) -> Result<(), RepairError<F::Error>> {
-        if self.incomplete_write {
+        // First, ensure that the idle space on the device is erased. This is
+        // important to do first, because we may need to evacuate the log to the
+        // other space to finish other repairs below.
+        if !self.other_erased {
+            self.flash.erase_space(self.current.other())?;
+            self.other_erased = true;
+        }
+
+        // Second, check if we found programmed sectors after the log in the
+        // current space. If this is the case, because we only assume we can
+        // erase at the space level, we need to evacuate the log and switch
+        // over. This will have the effect of clearing any incomplete write
+        // condition, so we do this before repairing an incomplete write.
+        if !self.tail_erased {
+            let evacuated_space = self.current;
+            let target_space = self.current.other();
+            // We've ensured that the idle space is erased, above. However, the
+            // evacuation process is about to start writing to it, so clear the
+            // flag in case it fails.
+            self.other_erased = false;
+
+            // Evacuate the entries from the current space.
+            let buffers = self.buffers.get_mut();
+            let r = low_level::evacuate(
+                &mut self.flash,
+                &mut buffers.b0,
+                &mut buffers.b1,
+                evacuated_space,
+                self.next_free,
+            );
+            use low_level::ReadError;
+            let target_watermark = match r {
+                Err(ReadError::Flash(e)) => return Err(e.into()),
+                Err(_) => return Err(RepairError::Corrupt),
+                Ok(n) => n,
+            };
+            // Switch the current space.
+            self.current = target_space;
+            self.next_free = target_watermark;
+            self.incomplete_write = false;
+
+            // Because evacuation only programs from the header to the end of
+            // the log, we can set the tail_erased flag now.
+            self.tail_erased = true;
+
+            // Now, erase the space we evacuated.
+            self.flash.erase_space(evacuated_space)?;
+
+            // Finally, we can restore other_erased to false.
+            self.other_erased = true;
+        } else if self.incomplete_write {
+            // We only check incomplete_write if tail_erased is true, for the
+            // reasons discussed above.
+
+            // We repair incomplete writes by filling in their trailer sector
+            // with the Aborted marker. The incomplete write will start at our
+            // end-of-log (next_free) location.
             let r = low_level::read_entry_from_head(
                 &mut self.flash,
                 &mut self.buffers.get_mut().b0,
@@ -120,6 +181,7 @@ impl<'b, F: Flash> Store<'b, F> {
                 Ok(entry) => entry,
             };
 
+            // Copy the entry metadata so we can stuff it into the trailer.
             let mut meta = *entry.meta;
             meta.subtype = low_level::KnownSubtypes::Aborted as u8;
             meta.sub_bytes = 0;
@@ -132,17 +194,15 @@ impl<'b, F: Flash> Store<'b, F> {
             *low_level::cast_suffix_mut(b).1 = meta;
             self.flash.program_sector(self.current, trailer, buffer)?;
 
+            // Update the end-of-log pointer to include this entry and clear the
+            // error.
             self.next_free = trailer + 1;
             self.incomplete_write = false;
         }
 
-        if !self.other_erased {
-            panic!("requires erase");
-        }
-
-        if !self.tail_erased {
-            panic!("requires evacuation and erase");
-        }
+        debug_assert!(!self.incomplete_write);
+        debug_assert!(self.tail_erased);
+        debug_assert!(self.other_erased);
 
         Ok(())
     }
@@ -159,7 +219,8 @@ impl<E> From<E> for RepairError<E> {
     }
 }
 
-
+/// A data store that is available for both reads and writes. (Reads happen by
+/// `Deref` to `Store`.)
 pub struct WritableStore<'b, F: Flash>(Store<'b, F>);
 
 impl<'b, F: Flash> core::ops::Deref for WritableStore<'b, F> {
@@ -170,6 +231,7 @@ impl<'b, F: Flash> core::ops::Deref for WritableStore<'b, F> {
 }
 
 impl<F: Flash> WritableStore<'_, F> {
+    /// Appends a data entry to the log assigning `value` to `key`.
     pub fn write_kv(
         &mut self,
         key: &[u8],
@@ -187,13 +249,19 @@ impl<F: Flash> WritableStore<'_, F> {
     }
 }
 
+/// Buffers required for the data store implementation on flash device `F`.
 #[derive(Default)]
 pub struct StoreBuffers<F: Flash> {
     pub b0: F::Sector,
     pub b1: F::Sector,
 }
 
-pub fn mount<F: Flash>(mut flash: F, buffers: &mut StoreBuffers<F>) -> Result<Store<'_, F>, MountError<F>> {
+/// Mounts `flash` for (initially) read-only access, performing an integrity
+/// check.
+pub fn mount<F: Flash>(
+    mut flash: F,
+    buffers: &mut StoreBuffers<F>,
+) -> Result<Store<'_, F>, MountError<F>> {
     match mount_inner(&mut flash, buffers) {
         Err(cause) => Err(MountError { flash, cause }),
         Ok((current, next_free, incomplete_write, tail_erased, other_erased)) => {

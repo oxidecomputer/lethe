@@ -306,6 +306,12 @@ pub trait Flash {
         data: &Self::Sector,
     ) -> Result<(), Self::Error>;
 
+    /// Erases the contents of `space`.
+    fn erase_space(
+        &mut self,
+        space: Space,
+    ) -> Result<(), Self::Error>;
+
     /// Compares `data.len()` bytes starting at `offset` from the start of
     /// sector `index` for equality. `offset` may be larger than a sector, for
     /// convenience.
@@ -1542,6 +1548,11 @@ mod tests {
                 panic!("attempt to double-program sector {index}");
             }
             *s = Some(*data);
+            Ok(())
+        }
+
+        fn erase_space(&mut self, space: Space) -> Result<(), Self::Error> {
+            self.sectors_mut(space).fill(None);
             Ok(())
         }
     }
