@@ -52,6 +52,12 @@ enum Cmd {
         #[clap(arg_enum)]
         space: ArgSpace,
     },
+    Corrupt {
+        #[clap(arg_enum)]
+        space: ArgSpace,
+        #[clap(subcommand)]
+        target: EraseTarget,
+    },
 }
 
 #[derive(Parser)]
@@ -145,6 +151,25 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                 EraseTarget::Sector { number } => {
                     println!("erasing sector {number} in space {space:?}");
                     img.erase_sector(space, number)?;
+                }
+            }
+        }
+        Cmd::Corrupt { space, target } => {
+            let space = Space::from(space);
+            match target {
+                EraseTarget::All => {
+                    println!("corrupting space {space:?}");
+                    img.erase_space(space)?;
+                    let nonsense = [0xAA; S];
+                    for s in 0..img.sectors_per_space() {
+                        img.program_sector(space, s, &nonsense)?;
+                    }
+                }
+                EraseTarget::Sector { number } => {
+                    println!("corrupting sector {number} in space {space:?}");
+                    img.erase_sector(space, number)?;
+                    let nonsense = [0xAA; S];
+                    img.program_sector(space, number, &nonsense)?;
                 }
             }
         }
