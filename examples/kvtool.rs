@@ -20,6 +20,7 @@ struct Kvtool {
 #[derive(Parser)]
 enum Cmd {
     Check,
+    Repair,
     Format {
         #[clap(arg_enum)]
         space: ArgSpace,
@@ -27,6 +28,8 @@ enum Cmd {
     Erase {
         #[clap(arg_enum)]
         space: ArgSpace,
+        #[clap(subcommand)]
+        target: EraseTarget,
     },
     Write {
         key: String,
@@ -45,6 +48,14 @@ enum Cmd {
     Evacuate {
         #[clap(arg_enum)]
         space: ArgSpace,
+    },
+}
+
+#[derive(Parser)]
+enum EraseTarget {
+    All,
+    Sector {
+        number: u32,
     },
 }
 
@@ -84,6 +95,15 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
     let mut buffer1 = [0; S];
 
     match args.cmd {
+        Cmd::Repair => {
+            with_mounted_image(img, |mut store| {
+                match store.repair() {
+                    Ok(()) => println!("success"),
+                    Err(e) => println!("error: {e:?}"),
+                }
+                Ok(())
+            })?;
+        }
         Cmd::Check => {
             for space in Space::ALL {
                 println!("checking space {:?}", space);
@@ -112,10 +132,18 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                 }
             }
         }
-        Cmd::Erase { space } => {
-            println!("erasing space {space:?}");
+        Cmd::Erase { space, target } => {
             let space = Space::from(space);
-            img.erase_space(space)?;
+            match target {
+                EraseTarget::All => {
+                    println!("erasing space {space:?}");
+                    img.erase_space(space)?;
+                }
+                EraseTarget::Sector { number } => {
+                    println!("erasing sector {number} in space {space:?}");
+                    img.erase_sector(space, number)?;
+                }
+            }
         }
         Cmd::Format { space } => {
             println!("formatting space {space:?}");
@@ -365,6 +393,16 @@ impl<const S: usize> FlashImage<S> {
             file: file.into(),
             sectors_per_space,
         })
+    }
+
+    fn erase_sector(&mut self, space: Space, sector: u32) -> Result<(), anyhow::Error> {
+        let global_sector = usize::from(space) as u64 * self.sectors_per_space as u64 + sector as u64;
+        let global_offset = global_sector * S as u64;
+        let mut file = self.file.borrow_mut();
+        file.seek(SeekFrom::Start(global_offset))?;
+        let data = [0xFF; S];
+        file.write_all(&data)?;
+        Ok(())
     }
 }
 

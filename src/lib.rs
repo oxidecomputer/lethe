@@ -208,6 +208,7 @@ impl<'b, F: Flash> Store<'b, F> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
 pub enum RepairError<E> {
     Corrupt,
     Flash(E),
