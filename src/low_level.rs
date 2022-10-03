@@ -420,6 +420,8 @@ pub fn bytes_to_sectors<F: Flash>(x: u32) -> u32 {
     (x + sector_size - 1) / sector_size
 }
 
+/// Provides a way to hang constants off an implementation of the Flash trait
+/// without them being overrideable to incorrect values by an implementation.
 pub struct Constants<F>(PhantomData<F>);
 
 impl<F: Flash> Constants<F> {
@@ -649,7 +651,7 @@ pub(crate) enum EntryDecision {
 ///
 /// - If `offset` is _outside_ the length of the contents, returns `Err(End)`.
 pub fn read_contents<F: Flash>(
-    flash: &mut F,
+    flash: &F,
     buffer: &mut F::Sector,
     current: Space,
     head_sector: u32,

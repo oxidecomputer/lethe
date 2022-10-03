@@ -2,8 +2,7 @@
 
 pub mod low_level;
 
-use core::mem::size_of;
-use core::borrow::{Borrow, BorrowMut};
+use core::borrow::BorrowMut;
 use crate::low_level::{Flash, Space};
 use core::cell::RefCell;
 
@@ -17,13 +16,87 @@ pub struct Store<'b, F: Flash> {
     other_erased: bool,
 }
 
+/// Basic read-only store access.
+impl<F: Flash> Store<'_, F> {
+    /// Searches for the most recent data entry matching `key` and reads its
+    /// value into `value_out`.
+    ///
+    /// At most `value_out.len()` bytes will be read; the actual value in the
+    /// entry may be longer than this. (TODO: not great.)
+    ///
+    /// On success, returns `Ok(Some(bytes_read))`. If no matching entry is
+    /// found, or if the key has been deleted, returns `Ok(None)`.
+    ///
+    /// Returns `Err` only if an error occurs accessing the flash dveice, or if
+    /// the log is found to be corrupt.
+    pub fn read_kv(
+        &self,
+        key: &[u8],
+        value_out: &mut [u8],
+    ) -> Result<Option<usize>, low_level::ReadError<F::Error>> {
+        let mut b = self.buffers.borrow_mut();
+        let loc = low_level::seek_kv_backwards(
+            &self.flash,
+            &mut b.b0,
+            self.current,
+            self.next_free,
+            key,
+        )?;
+
+        if let Some(head_sector) = loc {
+            let n = low_level::read_contents(
+                &self.flash,
+                &mut b.b0,
+                self.current,
+                head_sector,
+                key.len() as u32,
+                value_out,
+            )?;
+            Ok(Some(n))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Searches for the most recent data entry matching `key` and returns its
+    /// location in the current space. This is mostly useful for interacting
+    /// with lower level APIs.
+    ///
+    /// If found, returns `Ok(Some(sector_number))`. 
+    ///
+    /// If there is no entry for `key` or it has been deleted, returns
+    /// `Ok(None)`.
+    ///
+    /// Returns `Err` only if an error occurs accessing the flash device, or if
+    /// the log is found to be corrupt.
+    pub fn locate_kv(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<u32>, low_level::ReadError<F::Error>> {
+        let mut b = self.buffers.borrow_mut();
+        low_level::seek_kv_backwards(
+            &self.flash,
+            &mut b.b0,
+            self.current,
+            self.next_free,
+            key,
+        )
+    }
+}
+
+/// Accessing check results, repair, mounting writable.
 impl<'b, F: Flash> Store<'b, F> {
+    /// Checks whether the log check said we can mount this writable without
+    /// further effort.
     pub fn can_mount_writable(&self) -> bool {
         self.incomplete_write == false
             && self.tail_erased == true
             && self.other_erased == true
     }
 
+    /// Attempts to mount this writable without doing any repair actions. This
+    /// will fail if the check found problems, which you can detect in advance
+    /// by calling `can_mount_writable`.
     pub fn mount_writable(self) -> Result<WritableStore<'b, F>, Self> {
         if !self.can_mount_writable() {
             return Err(self);
@@ -86,114 +159,6 @@ impl<E> From<E> for RepairError<E> {
     }
 }
 
-impl<F: Flash> Store<'_, F> {
-    pub fn locate_kv(
-        &self,
-        key: &[u8],
-    ) -> Result<Option<u32>, low_level::ReadError<F::Error>> {
-        let mut b = self.buffers.borrow_mut();
-        low_level::seek_kv_backwards(
-            &self.flash,
-            &mut b.b0,
-            self.current,
-            self.next_free,
-            key,
-        )
-    }
-
-    // TODO this should not be in the high level interface since it allows
-    // arbitrary sector reads
-    pub fn read_contents(
-        &self,
-        head_sector: u32,
-        offset: u32,
-        out: &mut [u8],
-    ) -> Result<usize, low_level::ReadError<F::Error>> {
-        // Read the head sector. (TODO: in the case where we're being called by
-        // read_kv this is technically unnecessary; provide a path that can
-        // reuse the trailer metadata that function has already read.)
-        let mut b = self.buffers.borrow_mut();
-        let entry = low_level::read_entry_from_head(
-            &self.flash,
-            &mut b.b0,
-            self.current,
-            head_sector,
-        )?;
-
-        // Work out the actual shape of the read.
-        let overall_len = entry.meta.contents_length.get();
-        // Allow the offset to be anywhere up to the end; reject offsets beyond
-        // that as errors. Compute the remaining length past our offset.
-        let offset_len = overall_len.checked_sub(offset)
-            .ok_or(low_level::ReadError::End(overall_len))?;
-        // We'll read all of the remaining contents, or as much as will fit into
-        // `out`, whichever is shorter.
-        let read_size = usize::min(offset_len as usize, out.len());
-        let mut out = &mut out[..read_size];
-
-        // Adjust the offset to account for the entry header and submeta.
-        let mut offset = size_of::<low_level::EntryMeta>()
-            + entry.meta.sub_bytes as usize
-            + offset as usize;
-        // Work out our sector address given that offset.
-        let mut sector = head_sector as usize;
-
-        // TODO given that sector size is compile-time constant this should
-        // probably become div/mod.
-        while offset >= size_of::<F::Sector>() {
-            offset -= size_of::<F::Sector>();
-            sector += 1;
-        }
-
-        // Transfer the data!
-        while !out.is_empty() {
-            // Each time into this loop we need to read `sector`. For the first
-            // sector, `offset` will give a number of bytes to ignore; on
-            // subsequent sectors `offset` is zero.
-
-            self.flash.read_sector(
-                self.current,
-                sector as u32,
-                &mut b.b0,
-            )?;
-
-            // Copy out the sector (less our offset) but allow for shorter
-            // copies on the final sector.
-            let n = usize::min(size_of::<F::Sector>() - offset, out.len());
-            out[..n].copy_from_slice(&b.b0.borrow()[offset..offset + n]);
-
-            offset = 0;
-            sector += 1;
-            out = &mut out[n..];
-        }
-
-        Ok(read_size)
-    }
-
-    pub fn read_kv(
-        &self,
-        key: &[u8],
-        value_out: &mut [u8],
-    ) -> Result<Option<usize>, low_level::ReadError<F::Error>> {
-        let loc = {
-            // limit scope of borrow so that read_contents below can work
-            let mut b = self.buffers.borrow_mut();
-            low_level::seek_kv_backwards(
-                &self.flash,
-                &mut b.b0,
-                self.current,
-                self.next_free,
-                key,
-            )?
-        };
-
-        if let Some(head_sector) = loc {
-            Ok(Some(self.read_contents(head_sector, key.len() as u32, value_out)?))
-        } else {
-            Ok(None)
-        }
-    }
-}
 
 pub struct WritableStore<'b, F: Flash>(Store<'b, F>);
 
