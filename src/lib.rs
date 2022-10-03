@@ -248,8 +248,8 @@ pub fn mount<F: Flash>(mut flash: F, buffers: &mut StoreBuffers<F>) -> Result<St
 fn mount_inner<F: Flash>(flash: &mut F, buffers: &mut StoreBuffers<F>) -> Result<(Space, u32, bool, bool, bool), MountErrorCause<F::Error>> {
     // Run log checks on both spaces.
     use low_level::CheckResult;
-    let c0 = low_level::check(flash, &mut buffers.b0, &mut buffers.b1, Space::Zero)?;
-    let c1 = low_level::check(flash, &mut buffers.b0, &mut buffers.b1, Space::One)?;
+    let c0 = low_level::check(flash, &mut buffers.b0, Space::Zero)?;
+    let c1 = low_level::check(flash, &mut buffers.b0, Space::One)?;
 
     let (current, other_erased) = match (&c0, &c1) {
         // If both spaces contain valid data, choose the one with the greater

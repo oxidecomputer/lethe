@@ -90,7 +90,6 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
                 let result = sketch1::low_level::check(
                     &mut img,
                     &mut buffer0,
-                    &mut buffer1,
                     space,
                 )?;
 
@@ -183,7 +182,6 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             let result = sketch1::low_level::check(
                 &mut img,
                 &mut buffer0,
-                &mut buffer1,
                 space,
             )?;
 
@@ -280,7 +278,6 @@ fn specialized_main<const S: usize>(args: Kvtool) -> Result<(), anyhow::Error> {
             let result = sketch1::low_level::check(
                 &mut img,
                 &mut buffer0,
-                &mut buffer1,
                 space,
             )?;
 

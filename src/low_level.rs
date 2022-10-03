@@ -5,6 +5,41 @@ use zerocopy::{AsBytes, FromBytes, Unaligned};
 use num_traits::FromPrimitive;
 
 //////////////////////////////////////////////////////////////////////////////
+// Convenience wrappers for zerocopy.
+
+pub fn cast_prefix<T>(bytes: &[u8]) -> (&T, &[u8])
+    where T: FromBytes + Unaligned,
+{
+    let (lv, rest) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_prefix(bytes)
+        .expect("type does not fit in sector");
+    (lv.into_ref(), rest)
+}
+
+fn cast_prefix_mut<T>(bytes: &mut [u8]) -> (&mut T, &mut [u8])
+    where T: AsBytes + FromBytes + Unaligned,
+{
+    let (lv, rest) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_prefix(bytes)
+        .expect("type does not fit in sector");
+    (lv.into_mut(), rest)
+}
+
+fn cast_suffix<T>(bytes: &[u8]) -> (&[u8], &T)
+    where T: FromBytes + Unaligned,
+{
+    let (rest, lv) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_suffix(bytes)
+        .expect("type does not fit in sector");
+    (rest, lv.into_ref())
+}
+
+pub(crate) fn cast_suffix_mut<T>(bytes: &mut [u8]) -> (&mut [u8], &mut T)
+    where T: AsBytes + FromBytes + Unaligned,
+{
+    let (rest, lv) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_suffix(bytes)
+        .expect("type does not fit in sector");
+    (rest, lv.into_mut())
+}
+
+//////////////////////////////////////////////////////////////////////////////
 // At-rest layout.
 
 /// Shorthand for a `u16` in little-endian representation.
@@ -384,6 +419,560 @@ impl<F: Flash> Constants<F> {
     };
 }
 
+
+//////////////////////////////////////////////////////////////////////////////
+// Filesystem operations/algorithms: general entry structure, reading, and
+// search.
+
+/// Reads entry metadata given the address of its first (head) sector.
+///
+/// This will fail if the entry metadata is corrupt: bad magic number,
+/// sub-header size out of range, or nonsensical content length.
+///
+/// On success, the first sector of the entry is loaded into `buffer`, and an
+/// `EntryInfo` struct referencing `buffer` provides the parse results. The
+/// `EntryInfo::next_sector` field points to the sector _just past_ the tail
+/// sector of this entry -- which is where you'd need to apply
+/// `read_entry_from_head` again to continue forward through the log.
+pub fn read_entry_from_head<'b, F: Flash>(
+    flash: &F,
+    buffer: &'b mut F::Sector,
+    current: Space,
+    sector: u32,
+) -> Result<EntryInfo<'b>, ReadError<F::Error>> {
+    flash.read_sector(current, sector, buffer)?;
+    let data = (*buffer).borrow();
+    let (meta, data) = cast_prefix::<EntryMeta>(data);
+
+    if meta.magic.get() != EntryMeta::EXPECTED_MAGIC {
+        return Err(ReadError::BadMagic(sector));
+    }
+    let submeta = data.get(..usize::from(meta.sub_bytes))
+        .ok_or(ReadError::BadSubBytes(sector))?;
+
+    let meta_bytes = size_of::<EntryMeta>() as u32
+        + u32::from(meta.sub_bytes);
+
+    let entry_length = 2 * meta_bytes + meta.contents_length.get();
+    let next_sector = sector.checked_add(bytes_to_sectors::<F>(entry_length))
+        .ok_or(ReadError::BadLength(sector))?;
+
+    Ok(EntryInfo {
+        next_sector,
+        meta,
+        submeta,
+    })
+}
+
+/// Parsed information about an entry.
+#[derive(Copy, Clone, Debug)]
+pub struct EntryInfo<'a> {
+    /// Sector number of the other end of this entry. Which end depends on which
+    /// direction you were reading in.
+    pub next_sector: u32,
+    /// Entry metadata in sector buffer.
+    pub meta: &'a EntryMeta,
+    /// Entry sub-metadata in sector buffer.
+    pub submeta: &'a [u8],
+}
+
+/// Things that can go wrong while reading low-level entries.
+#[derive(Copy, Clone, Debug)]
+pub enum ReadError<E> {
+    /// Magic number (given) was wrong.
+    BadMagic(u32),
+    /// Length of sub-metadata (given) was too large.
+    BadSubBytes(u32),
+    /// Content length of entry (given) was too large for device.
+    BadLength(u32),
+
+    // TODO: probably doesn't belong in low_level
+    End(u32),
+
+    Flash(E),
+}
+
+impl<E> From<E> for ReadError<E> {
+    fn from(e: E) -> Self {
+        Self::Flash(e)
+    }
+}
+
+/// Reads entry metadata given the address of the first sector past its final
+/// sector (tail).
+///
+/// This will fail if the entry metadata is corrupt: bad magic number,
+/// sub-header size out of range, or nonsensical content length.
+///
+/// On success, the last sector of the entry is loaded into `buffer`, and an
+/// `EntryInfo` struct referencing `buffer` provides the parse results. The
+/// `EntryInfo::next_sector` field points to the entry's head (first) sector --
+/// which is where you'd need to apply `read_entry_from_tail` again to continue
+/// backward through the log.
+pub(crate) fn read_entry_from_tail<'b, F: Flash>(
+    flash: &F,
+    buffer: &'b mut F::Sector,
+    current: Space,
+    sector: u32,
+) -> Result<EntryInfo<'b>, ReadError<F::Error>> {
+    // Adjust sector number to point at the tail instead of just past it.
+    let sector = sector - 1;
+
+    flash.read_sector(current, sector, buffer)?;
+    let data = (*buffer).borrow();
+    let (data, meta) = cast_suffix::<EntryMeta>(data);
+
+    if meta.magic.get() != EntryMeta::EXPECTED_MAGIC {
+        return Err(ReadError::BadMagic(sector));
+    }
+    let submeta_start = data.len().checked_sub(usize::from(meta.sub_bytes))
+        .ok_or(ReadError::BadSubBytes(sector))?;
+    let submeta = &data[submeta_start..];
+
+    let meta_bytes = size_of::<EntryMeta>() as u32
+        + u32::from(meta.sub_bytes);
+
+    let entry_length = 2 * meta_bytes + meta.contents_length.get();
+    let next_trailer = sector
+        .checked_sub(bytes_to_sectors::<F>(entry_length))
+        .ok_or(ReadError::BadLength(sector))?;
+    let next_sector = next_trailer + 1;
+
+    Ok(EntryInfo {
+        next_sector,
+        meta,
+        submeta,
+    })
+}
+
+/// Processes entries in the log in space `current` starting from the end
+/// (`start_sector`) and working backwards. Each entry is presented to `filter`,
+/// which controls the traversal.
+///
+/// If `filter` returns `Ignore` for an entry, traversal continues. If traversal
+/// hits the start of the log, this function returns `Ok(None)`.
+///
+/// If it returns `Accept`, traversal stops, and the head sector number for the
+/// entry is returned.
+///
+/// If it returns `Abort`, traversal stops, and the function returns `Ok(None)`
+/// as if no entry were found. (This is helpful for implementing Delete
+/// entries.)
+pub(crate) fn seek_backwards<'b, F: Flash>(
+    flash: &F,
+    buffer: &'b mut F::Sector,
+    current: Space,
+    start_sector: u32,
+    mut filter: impl FnMut(&F, &mut F::Sector, u32, KnownSubMetas) -> Result<EntryDecision, F::Error>,
+) -> Result<Option<u32>, ReadError<F::Error>> {
+    let header_sectors = Constants::<F>::HEADER_SECTORS;
+
+    assert!(start_sector >= header_sectors);
+
+    let mut sector = start_sector;
+
+    while sector > header_sectors {
+        let entry = read_entry_from_tail(flash, buffer, current, sector)?;
+
+        let head_sector = entry.next_sector;
+        let ksh = KnownSubMetas::new(entry.meta.subtype, entry.submeta);
+
+        let r = filter(flash, buffer, head_sector, ksh)?;
+        match r {
+            EntryDecision::Ignore => (),
+            EntryDecision::Accept => return Ok(Some(head_sector)),
+            EntryDecision::Abort => return Ok(None),
+        }
+
+        sector = head_sector;
+    }
+
+    Ok(None)
+}
+
+/// Metadata passed by-value to an entry seek predicate.
+#[derive(Copy, Clone, Debug)]
+pub enum KnownSubMetas {
+    Data(DataSubMeta),
+    Delete(DeleteSubMeta),
+    Aborted,
+    Other(u8),
+}
+
+impl KnownSubMetas {
+    pub fn new(subtype: u8, submeta: &[u8]) -> Self {
+        match KnownSubtypes::from_u8(subtype) {
+            Some(KnownSubtypes::Data) => Self::Data(*cast_prefix(submeta).0),
+            Some(KnownSubtypes::Delete) => Self::Delete(*cast_prefix(submeta).0),
+            Some(KnownSubtypes::Aborted) => Self::Aborted,
+            None => Self::Other(subtype),
+        }
+    }
+}
+
+/// Decisions a predicate may make about an entry during log traversal.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum EntryDecision {
+    /// Keep going.
+    Ignore,
+    /// This is the entry we were looking for.
+    Accept,
+    /// Something about this entry means that the log doesn't _contain_ the
+    /// entry we were looking for.
+    Abort,
+}
+
+/// Reads the contents bytes of an entry -- the stuff between the sub-header and
+/// sub-trailer. This is a raw access function used in the implementation of
+/// higher level access functions, and is exposed for use in tooling.
+///
+/// When applied to a Data entry, this will read out the raw data record. Other
+/// entries do not currently have contents.
+///
+/// The entry will be found starting at `head_sector` in `flash` from the
+/// `current` space. Data will be copied starting `offset` bytes into the
+/// contents, into `out`. `buffer` will be scribbled upon in the process as
+/// scratch.
+///
+/// This works somewhat like POSIX read:
+///
+/// - If there are `out.len()` bytes available to read starting at `offset`,
+///   this returns `Ok(out.len())` to indicate that it has filled `out`.
+///
+/// - If it would overlap the end of the entry's contents, it only fills in as
+///   much of `out` as there are bytes available, and returns
+///   `Ok(bytes_filled)`.
+///
+/// - If `offset` is exactly the length of the contents, returns `Ok(0)`.
+///
+/// - If `offset` is _outside_ the length of the contents, returns `Err(End)`.
+pub fn read_contents<F: Flash>(
+    flash: &mut F,
+    buffer: &mut F::Sector,
+    current: Space,
+    head_sector: u32,
+    offset: u32,
+    out: &mut [u8],
+) -> Result<usize, ReadError<F::Error>> {
+    let entry = read_entry_from_head(
+        flash,
+        buffer,
+        current,
+        head_sector,
+    )?;
+    // Reject offsets that are totally outside the contents.
+    let len_after_offset = entry.meta.contents_length.get()
+        .checked_sub(offset)
+        .ok_or(ReadError::End(entry.meta.contents_length.get()))?;
+    // Compute the sector-relative offset by adding the length of the headers.
+    let abs_offset = size_of::<EntryMeta>()
+        + usize::from(entry.meta.sub_bytes)
+        + offset as usize;
+    // Limit the length of the read to the size of the out buffer.
+    let xfer_len = usize::min(len_after_offset as usize, out.len());
+
+    // Set up our loop variables by computing our starting sector, offset within
+    // the sector, and length of output buffer.
+    let mut sector = head_sector as usize
+        + abs_offset / size_of::<F::Sector>();
+    let mut offset = abs_offset % size_of::<F::Sector>();
+    let mut out = &mut out[..xfer_len];
+
+    while !out.is_empty() {
+        flash.read_sector(
+            current,
+            sector as u32,
+            buffer,
+        )?;
+
+        let n = usize::min(size_of::<F::Sector>() - offset, xfer_len);
+        out[..n].copy_from_slice(&(*buffer).borrow()[offset..offset + n]);
+
+        // To prepare for the next iteration, we zero offset (so that it's
+        // non-zero only on the first iteration) and advance the others.
+        offset = 0;
+        sector += 1;
+        out = &mut out[n..];
+    }
+
+    Ok(xfer_len)
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Filesystem operations/algorithms: general entry writing.
+
+/// Writes a new entry.
+///
+/// The entry will be written starting at `start_sector` in `flash`, in the
+/// space `current`.
+///
+/// The entry will be constructed from:
+///
+/// - the slices in `pieces`, in order without padding,
+/// - enough padding to right-align the remainder,
+/// - `subtrailer` and `trailer` in that order.
+///
+/// This means that, in practice, `pieces[0]` should be the header metadata and
+/// `pieces[1]` the submetadata.
+///
+/// On success, this function returns the sector number of the next free sector
+/// after the entry is written.
+///
+/// Sectors are written strictly in-order, so on a write failure, you'll be left
+/// in one of three possible states:
+///
+/// 1. The failure prevented the header from being written. The contents of the
+///    log are unchanged.
+/// 2. The failure happened somewhere before the trailer was finished and the
+///    log now ends in an incomplete entry.
+/// 3. The failure happened during write of the final sector, but did not
+///    prevent the sector from being written; the log now ends in your complete
+///    entry as though no error occurred. (We allow for this case to make flash
+///    device implementation slightly easier.)
+///
+/// You can use `check_entry` if you need to distinguish, or treat any error as
+/// potentially incomplete and attempt to repair the log.
+pub(crate) fn write_entry<F: Flash>(
+    flash: &mut F,
+    buffer: &mut F::Sector,
+    current: Space,
+    start_sector: u32,
+    pieces: &[&[u8]],
+    subtrailer: &[u8],
+    trailer: &[u8],
+) -> Result<u32, WriteError<F::Error>> {
+    // Work out the length without padding.
+    let total_length = pieces.iter().map(|p| p.len()).sum::<usize>()
+        + subtrailer.len()
+        + trailer.len();
+    let total_length = u32::try_from(total_length).unwrap();
+    // Convert to sectors, which has the effect of including the padding.
+    let total_sectors = bytes_to_sectors::<F>(total_length);
+    // Detect out-of-space.
+    if flash.sectors_per_space() - start_sector < total_sectors {
+        return Err(WriteError::NoSpace);
+    }
+
+    // Set up loop variables. Management of these variables is a little subtle
+    // since we don't require `pieces` to be sector-aligned.
+    let mut sector = start_sector;
+    let mut data = buffer.borrow_mut();
+
+    // Gather all the `pieces` and write them contiguously.
+    for mut piece in pieces.iter().cloned() {
+        // Loop because a piece may be larger than a sector.
+        while !piece.is_empty() {
+            // Break both the piece and the remaining sector buffer into the
+            // largest common chunk (piece0/data0) and the remainder
+            // (piece1/data1).
+            let n = usize::min(piece.len(), data.len());
+            let (piece0, piece1) = piece.split_at(n);
+            let (data0, data1) = data.split_at_mut(n);
+
+            data0.copy_from_slice(piece0);
+
+            piece = piece1;
+            data = data1;
+
+            // Check for entirely filled sector buffer; write it out and reset
+            // it.
+            if data.is_empty() {
+                drop(data);
+
+                flash.program_sector(current, sector, buffer)?;
+                sector += 1;
+
+                data = buffer.borrow_mut();
+            }
+        }
+    }
+
+    // Check how much space we have left in the final sector.
+    if data.len() < subtrailer.len() + trailer.len() {
+        // We can't fit the full trailer into the final sector, so we have to
+        // burn a sector on the trailer by flushing this sector and starting a
+        // new one.
+        //
+        // Zero-fill the remainder of the flushed sector to avoid writing
+        // arbitrary goo.
+        data.fill(0);
+        drop(data);
+
+        flash.program_sector(current, sector, buffer)?;
+        sector += 1;
+
+        data = buffer.borrow_mut();
+    }
+
+    // Fill in the trailer.
+    {
+        // Split remaining sector tail into unused area, which will be filled
+        // with padding, and the trailer part.
+        let dl = data.len();
+        let unused = dl - trailer.len() - subtrailer.len();
+        let (pad, tail) = data.split_at_mut(unused);
+        pad.fill(0);
+
+        // Now split the tail into subtrailer and trailer regions and fill them
+        // in.
+        let (sub, tail) = tail.split_at_mut(subtrailer.len());
+        sub.copy_from_slice(subtrailer);
+        tail.copy_from_slice(trailer);
+    }
+
+    // Write the final sector.
+    drop(data);
+    flash.program_sector(current, sector, buffer)?;
+
+    Ok(sector + 1)
+}
+
+/// Things that can go wrong while writing an entry.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WriteError<E> {
+    /// There is not enough space on the flash device to add this entry to the
+    /// log.
+    NoSpace,
+    /// An underlying flash access error occurred.
+    Flash(E),
+}
+
+impl<E> From<E> for WriteError<E> {
+    fn from(e: E) -> Self {
+        Self::Flash(e)
+    }
+}
+
+
+//////////////////////////////////////////////////////////////////////////////
+// Data entry implementation.
+
+/// Searches backwards through the log for a data entry matching `key`.
+///
+/// `start_sector` is the index of the sector _just past_ the valid data you
+/// wish to search. The search will start at `start_sector - 1` and run back to
+/// the space header, stopping prematurely if a matching entry is found.
+///
+/// Return values:
+///
+/// - `Ok(Some(n))` indicates that a matching entry was found, and its header
+///   sector is at index `n`.
+/// - `Ok(None)` indicates that there is no matching entry in the log, either
+///   because it does not exist, or because it has been deleted.
+/// - `Err(e)` if the search could not be completed because a corrupt entry was
+///   discovered, or if the underlying flash layer returns an error.
+pub(crate) fn seek_kv_backwards<F: Flash>(
+    flash: &F,
+    buffer: &mut F::Sector,
+    current: Space,
+    start_sector: u32,
+    key: &[u8],
+) -> Result<Option<u32>, ReadError<F::Error>> {
+    let key_len = u32::try_from(key.len())
+        .expect("key too long");
+    let key_hash = hash_key(key);
+
+    seek_backwards(
+        flash,
+        buffer,
+        current,
+        start_sector,
+        |flash, buffer, index, ksub| {
+            match ksub {
+                KnownSubMetas::Data(sub) | KnownSubMetas::Delete(sub) => {
+                    // For these types, we want to check the key.
+                    if sub.key_hash.get() == key_hash
+                        && sub.key_length.get() == key_len
+                    {
+                        // A potential match! We need to compare the first
+                        // `key.len()` bytes after the header.
+                        let meta_bytes = size_of::<EntryMeta>()
+                            + size_of::<DataSubMeta>();
+                        let key_eq = flash.compare_contents(
+                            current,
+                            buffer,
+                            index,
+                            meta_bytes as u32,
+                            key,
+                        )?;
+                        if key_eq {
+                            // Now, the difference between Data and Delete comes
+                            // into play.
+                            if matches!(ksub, KnownSubMetas::Data(_)) {
+                                return Ok(EntryDecision::Accept)
+                            } else {
+                                // A delete entry causes us to early-abort with no
+                                // match:
+                                return Ok(EntryDecision::Abort)
+                            };
+                        }
+                    }
+                }
+                _ => {
+                    // Everything else, we'll just skip.
+                }
+            }
+            Ok(EntryDecision::Ignore)
+        },
+    )
+}
+
+/// Writes a new Data entry for `key` storing `value` and superceding any
+/// previous entry for `key`.
+///
+/// The entry will be written starting at `start_sector` (inclusive) into
+/// `flash` in space `current`. `buffer` will be scribbled on by the
+/// implementation.
+pub(crate) fn write_kv<F: Flash>(
+    flash: &mut F,
+    buffer: &mut F::Sector,
+    current: Space,
+    start_sector: u32,
+    key: &[u8],
+    value: &[u8],
+) -> Result<u32, WriteError<F::Error>> {
+    // Paranoid parameter validation: are any of these too large for a u32? On a
+    // 32-bit platform this can't happen.
+    let key_len = u32::try_from(key.len())
+        .expect("key too long");
+    let value_len = u32::try_from(value.len())
+        .expect("value too long");
+    let contents_length = key_len.checked_add(value_len)
+        .expect("key+value too long");
+
+    // Construct header/trailer. The same bits do double-duty in both places.
+    let meta = EntryMeta {
+        magic: EntryMeta::EXPECTED_MAGIC.into(),
+        subtype: KnownSubtypes::Data as u8,
+        sub_bytes: DataSubMeta::SUB_BYTES,
+        contents_length: contents_length.into(),
+    };
+    let submeta = DataSubMeta {
+        key_length: key_len.into(),
+        key_hash: hash_key(key).into(),
+    };
+
+    // Go!
+    write_entry(
+        flash,
+        buffer,
+        current,
+        start_sector,
+        &[
+            meta.as_bytes(),
+            submeta.as_bytes(),
+            key,
+            value,
+        ],
+        // Note that order is reversed here:
+        submeta.as_bytes(),
+        meta.as_bytes(),
+    )
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Space formatting and checking.
+
 /// Creates a new empty log in device `flash` and space `current`.
 ///
 /// This requires that the space has been erased. If it has not been erased,
@@ -434,28 +1023,42 @@ impl<E> From<E> for FormatError<E> {
     }
 }
 
+/// Scans the contents of `flash` to determine the state of space `current`.
+///
+/// `buffer` will be scribbled on by the implementation as scratch space.
+///
+/// This function will fail (return `Err`) only if it is unable to scan the
+/// space. An `Ok` return means that the check finished, _not_ that the space
+/// contains a valid log. See the `CheckResult` type for more details.
 pub fn check<F: Flash>(
     flash: &mut F,
-    buffer0: &mut F::Sector,
-    buffer1: &mut F::Sector,
+    buffer: &mut F::Sector,
     current: Space,
 ) -> Result<CheckResult, F::Error> {
     let sector_count = flash.sectors_per_space();
 
+    // Check if the first sector is programmable and use that as a proxy for
+    // "erased." Our space header contents are (deliberately) distinguishable
+    // from typical erased flash, even for devices that allow us to read back
+    // erased sectors, so this should be universal.
     if flash.can_program_sector(current, 0)? {
         // Well, there's no valid store here... let's distinguish between full
-        // and partial erase.
-        for sector in 0..sector_count {
+        // and partial erase to help our caller out.
+        for sector in 1..sector_count {
             if !flash.can_program_sector(current, sector)? {
+                // There's at least one un-erased sector; we're going to have to
+                // erase this space before we can use it.
                 return Ok(CheckResult::Bad(CheckError::PartiallyErased));
             }
         }
 
+        // This space is empty and could be used as an idle space.
         return Ok(CheckResult::Bad(CheckError::Erased));
     }
-    flash.read_sector(current, 0, buffer0)?;
-    let (space_header, _) = cast_prefix::<SpaceHeader>((*buffer0).borrow());
-    let generation = space_header.generation.get();
+
+    // Check the space header!
+    flash.read_sector(current, 0, buffer)?;
+    let (space_header, _) = cast_prefix::<SpaceHeader>((*buffer).borrow());
 
     if !space_header.check() {
         return Ok(CheckResult::Bad(CheckError::BadSpaceHeader));
@@ -464,22 +1067,34 @@ pub fn check<F: Flash>(
         return Ok(CheckResult::Bad(CheckError::WrongSectorSize));
     }
 
-    let mut sector = Constants::<F>::HEADER_SECTORS;
-    let mut incomplete_write = false;
+    // Copy the generation out so that we can let go of buffer0.
+    let generation = space_header.generation.get();
+    drop(space_header);
 
+    let mut sector = Constants::<F>::HEADER_SECTORS;
+    let mut incomplete_write_end = None;
+
+    // Work over the remaining sectors in the (alleged) log, treating them as
+    // log entries.
     while sector < sector_count {
-        let r = check_entry(flash, buffer0, buffer1, current, sector)?;
-        #[cfg(test)]
-        println!("check_entry result: {:?}", r);
+        let r = check_entry(flash, buffer, current, sector)?;
 
         match r {
+            CheckEntryResult::ChecksPassed(next) => {
+                // Advance the sector pointer and _keep going!_
+                sector = next;
+            }
+
             CheckEntryResult::HeadErased => {
-                // This is probably the end of the log in this space.
+                // This is probably the end of the log in this space. Don't
+                // advance the sector pointer.
                 break;
             }
             CheckEntryResult::IncompleteWrite(next) => {
-                sector = next;
-                incomplete_write = true;
+                // Note that we need repair. DO NOT advance the sector pointer!
+                // We will leave the incomplete write just past the end of the
+                // valid log so that reads don't have to think about it.
+                incomplete_write_end = Some(next);
                 break;
             }
 
@@ -492,29 +1107,39 @@ pub fn check<F: Flash>(
             CheckEntryResult::PartiallyErased => {
                 return Ok(CheckResult::Bad(CheckError::UnprogrammedData(sector)));
             }
-
-            CheckEntryResult::ChecksPassed(next) => sector = next,
         }
     }
-
     
+    // Now, scan the rest of the space to see if we've really found the end of
+    // the log, i.e. whether the rest of the space is erased.
+    //
+    // We want to start the scan at the end of the log, _or_ just past an
+    // incomplete write, if one was found.
     let mut tail_erased = true;
-    for s in sector+1..sector_count {
+    let scan_start = incomplete_write_end.unwrap_or(sector);
+    for s in scan_start..sector_count {
         if !flash.can_program_sector(current, s)? {
+            // Welp, there's at least one unerased turd in the space past the
+            // end of the log, which means we can't mount this writable yet.
             tail_erased = false;
             break;
         }
     }
+
+    // Return our findings.
     Ok(CheckResult::ValidLog {
         generation,
         end: sector,
-        incomplete_write,
+        incomplete_write: incomplete_write_end.is_some(),
         tail_erased,
     })
 }
 
+/// Result of completing the `check` process.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CheckResult {
+    /// There is no valid log in this space, for the reason documented in
+    /// `CheckError`.
     Bad(CheckError),
 
     /// A valid data store was found, with a valid header and some number of
@@ -525,17 +1150,22 @@ pub enum CheckResult {
     /// To mount read-write, `tail_erased` must be true, and `incomplete_write`
     /// must be false. Or, repair action must be taken.
     ValidLog {
+        /// Generation number found in the space header.
         generation: u32,
+        /// Index of first non-log sector in the space.
         end: u32,
+        /// Whether all sectors in the space starting with `end` have been
+        /// erased (`true`) or if some haven't (`false`).
         tail_erased: bool,
         incomplete_write: bool,
     }
 }
 
+/// Errors reported by the `check` process.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CheckError {
-    /// The space is entirely erased. It can be used as the idle space with no
-    /// further work.
+    /// While there is no log in the space, the space is entirely erased. It can
+    /// be used as the idle space with no further work.
     Erased,
     /// Not all of the sectors in the space have been erased, but enough have
     /// been erased to render the data structure useless. It must be fully
@@ -554,23 +1184,17 @@ pub enum CheckError {
     Corrupt(u32),
 
     /// An entry at the given sector number contains at least one unprogrammed
-    /// sector, making it unsafe to read. 
+    /// sector, making it unsafe to read. You may be able to successfully read a
+    /// prior version of the store by treating this as the end of the log.
     UnprogrammedData(u32),
-}
-
-pub enum LogTailStatus {
-    /// All sectors after the log are ready to be programmed.
-    Erased,
-    /// At least one sector after the log is already programmed. This means
-    /// erasing is required before we can write.
-    PartiallyErased,
-    /// 
-    IncompleteWrite,
 }
 
 /// Reads the entry starting at `head_sector` and checks that it's valid.
 ///
-/// There are three classes of results from this operation.
+/// Note that success (`Ok`) of this function just means that the check
+/// completed without flash access errors. It does _not_ mean the entry is fine.
+///
+/// There are three classes of `Ok` results from this operation.
 ///
 /// Results that indicate everything is fine:
 /// - `ChecksPassed(next)` indicates a valid and matching head/tail, that all
@@ -587,37 +1211,43 @@ pub enum LogTailStatus {
 /// corruption.
 pub(crate) fn check_entry<F: Flash>(
     flash: &mut F,
-    buffer0: &mut F::Sector,
-    buffer1: &mut F::Sector,
+    buffer: &mut F::Sector,
     current: Space,
     head_sector: u32,
 ) -> Result<CheckEntryResult, F::Error> {
-    #[cfg(test)]
-    println!("checking entry at {head_sector}");
-
+    // Check if the first sector is written.
     if flash.can_program_sector(current, head_sector)? {
         return Ok(CheckEntryResult::HeadErased);
     }
-    let head_info = match read_entry_from_head(flash, buffer0, current, head_sector) {
+    // Attempt to read and parse the header.
+    let head_info = match read_entry_from_head(flash, buffer, current, head_sector) {
         Err(ReadError::Flash(e)) => return Err(e),
         Err(_) => return Ok(CheckEntryResult::HeadCorrupt),
         Ok(entry) => entry,
     };
 
+    // Using the length information from the header, locate the tail sector and
+    // see if it's programmed. Unprogrammed tail sector indicates an incomplete
+    // write.
     if flash.can_program_sector(current, head_info.next_sector - 1)? {
         return Ok(CheckEntryResult::IncompleteWrite(head_info.next_sector));
     }
 
+    // Get ready to read the tail sector by freeing the buffer.
     let next_entry = head_info.next_sector;
+    let head_meta = *head_info.meta;
+    drop(head_info);
 
-    let tail_info = match read_entry_from_tail(flash, buffer1, current, next_entry) {
+    // Attempt to read and parse the trailer.
+    let tail_info = match read_entry_from_tail(flash, buffer, current, next_entry) {
         Err(ReadError::Flash(e)) => return Err(e),
         Err(_) => return Ok(CheckEntryResult::TailCorrupt),
         Ok(entry) => entry,
     };
-    
+   
+    // Make sure the basics match the header.
     if tail_info.next_sector != head_sector
-        || tail_info.meta.contents_length != head_info.meta.contents_length
+        || tail_info.meta.contents_length != head_meta.contents_length
     {
         return Ok(CheckEntryResult::HeadTailMismatch);
     }
@@ -626,8 +1256,8 @@ pub(crate) fn check_entry<F: Flash>(
     // trailer may be marked Aborted, regardless of how the header is marked. In
     // this case we still require the other fields to match.
     if tail_info.meta.subtype != KnownSubtypes::Aborted as u8
-        && (tail_info.meta.subtype != head_info.meta.subtype 
-            || tail_info.meta.sub_bytes != head_info.meta.sub_bytes)
+        && (tail_info.meta.subtype != head_meta.subtype 
+            || tail_info.meta.sub_bytes != head_meta.sub_bytes)
     {
         return Ok(CheckEntryResult::HeadTailMismatch);
     }
@@ -635,7 +1265,8 @@ pub(crate) fn check_entry<F: Flash>(
     if tail_info.meta.subtype != KnownSubtypes::Aborted as u8 {
         // For any other subtype we require the entry's sectors to be totally
         // readable, which typically means programmed -- though some flashes
-        // will expose unprogrammed sectors as all FF, which is ok here.
+        // will expose unprogrammed sectors as all FF, which we tolerate because
+        // it won't introduce flash read errors into log operations.
         for s in head_sector + 1..next_entry {
             if !flash.can_read_sector(current, s)? {
                 return Ok(CheckEntryResult::PartiallyErased);
@@ -646,6 +1277,7 @@ pub(crate) fn check_entry<F: Flash>(
     Ok(CheckEntryResult::ChecksPassed(next_entry))
 }
 
+/// Possible successful results of `check_entry`.
 #[derive(Copy, Clone, Debug)]
 pub enum CheckEntryResult {
     /// The head sector for this entry is blank. This probably means you've
@@ -678,405 +1310,48 @@ pub enum CheckEntryResult {
     ChecksPassed(u32),
 }
 
-#[derive(Copy, Clone, Debug)]
-pub enum ReadError<E> {
-    BadMagic(u32),
-    BadSubBytes(u32),
-    BadLength(u32),
+//////////////////////////////////////////////////////////////////////////////
+// Space evacuation / garbage collection.
 
-    // TODO: probably doesn't belong in low_level
-    End(u32),
-
-    Flash(E),
-}
-
-impl<E> From<E> for ReadError<E> {
-    fn from(e: E) -> Self {
-        Self::Flash(e)
-    }
-}
-
-pub(crate) fn seek_backwards<'b, F: Flash>(
-    flash: &F,
-    buffer: &'b mut F::Sector,
-    current: Space,
-    start_sector: u32,
-    mut filter: impl FnMut(&F, &mut F::Sector, u32, KnownSubMetas) -> Result<EntryDecision, F::Error>,
-) -> Result<Option<u32>, ReadError<F::Error>> {
-    let header_sectors = Constants::<F>::HEADER_SECTORS;
-
-    assert!(start_sector >= header_sectors);
-
-    let mut sector = start_sector;
-
-    while sector > header_sectors {
-        let entry = read_entry_from_tail(flash, buffer, current, sector)?;
-
-        let head_sector = entry.next_sector;
-        let ksh = KnownSubMetas::new(entry.meta.subtype, entry.submeta);
-
-        let r = filter(flash, buffer, head_sector, ksh)?;
-        match r {
-            EntryDecision::Ignore => (),
-            EntryDecision::Accept => return Ok(Some(head_sector)),
-            EntryDecision::Abort => return Ok(None),
-        }
-
-        sector = head_sector;
-    }
-
-    Ok(None)
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum EntryDecision {
-    Ignore,
-    Accept,
-    Abort,
-}
-
-/// Searches backwards through the log for a data entry matching `key`.
+/// Processes the log in `from_space`, identifies the subset of its entries that
+/// have not been superceded by later entries, and copies them into the opposite
+/// space on the same flash device.
 ///
-/// `start_sector` is the index of the sector _just past_ the valid data you
-/// wish to search. The search will start at `start_sector - 1` and run back to
-/// the space header, stopping prematurely if a matching entry is found.
+/// The relative order of the entries is _not_ preserved, to simplify the
+/// implementation.
 ///
-/// Return values:
+/// `watermark` is the number of sectors in `from_space` that have been written,
+/// i.e. the length of the log including the space header.
 ///
-/// - `Ok(Some(n))` indicates that a matching entry was found, and its header
-///   sector is at index `n`.
-/// - `Ok(None)` indicates that there is no matching entry in the log, either
-///   because it does not exist, or because it has been deleted.
-/// - `Err(e)` if the search could not be completed because a corrupt entry was
-///   discovered, or if the underlying flash layer returns an error.
-pub(crate) fn seek_kv_backwards<F: Flash>(
-    flash: &F,
-    buffer: &mut F::Sector,
-    current: Space,
-    start_sector: u32,
-    key: &[u8],
-) -> Result<Option<u32>, ReadError<F::Error>> {
-    let key_len = u32::try_from(key.len())
-        .expect("key too long");
-    let key_hash = hash_key(key);
-
-    seek_backwards(
-        flash,
-        buffer,
-        current,
-        start_sector,
-        |flash, buffer, index, ksub| {
-            match ksub {
-                KnownSubMetas::Data(sub) | KnownSubMetas::Delete(sub) => {
-                    // For these types, we want to check the key.
-                    if sub.key_hash.get() == key_hash
-                        && sub.key_length.get() == key_len
-                    {
-                        // A potential match!
-                        let meta_bytes = size_of::<EntryMeta>()
-                            + size_of::<DataSubMeta>();
-                        let key_eq = flash.compare_contents(current, buffer, index, meta_bytes as u32, key)?;
-                        if key_eq {
-                            // Now, the difference between Data and Delete comes
-                            // into play.
-                            if matches!(ksub, KnownSubMetas::Data(_)) {
-                                return Ok(EntryDecision::Accept)
-                            } else {
-                                // A delete entry causes us to early-abort with no
-                                // match:
-                                return Ok(EntryDecision::Abort)
-                            };
-                        }
-                    }
-                }
-                _ => {
-                    // Everything else, we'll just skip.
-                }
-            }
-            Ok(EntryDecision::Ignore)
-        },
-    )
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum KnownSubMetas {
-    Data(DataSubMeta),
-    Delete(DeleteSubMeta),
-    Aborted,
-    Other(u8),
-}
-
-impl KnownSubMetas {
-    pub fn new(subtype: u8, submeta: &[u8]) -> Self {
-        match KnownSubtypes::from_u8(subtype) {
-            Some(KnownSubtypes::Data) => Self::Data(*cast_prefix(submeta).0),
-            Some(KnownSubtypes::Delete) => Self::Delete(*cast_prefix(submeta).0),
-            Some(KnownSubtypes::Aborted) => Self::Aborted,
-            None => Self::Other(subtype),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct EntryInfo<'a> {
-    pub next_sector: u32,
-    pub meta: &'a EntryMeta,
-    pub submeta: &'a [u8],
-}
-
-/// Reads an entry from the end; `start_sector` is the index of the sector _one
-/// past the end_ of the entry.
+/// `buffer0` and `buffer1` are temporary storage space used by the
+/// implementation, and their contents will be scribbled upon.
 ///
-/// If this returns `Ok`, `buffer` will also contain a copy of the entry's
-/// trailer. This is a deliberate side effect.
-pub(crate) fn read_entry_from_tail<'b, F: Flash>(
-    flash: &F,
-    buffer: &'b mut F::Sector,
-    current: Space,
-    start_sector: u32,
-) -> Result<EntryInfo<'b>, ReadError<F::Error>> {
-    let sector = start_sector - 1;
-
-    flash.read_sector(current, sector, buffer)?;
-    let data = (*buffer).borrow();
-    let (data, meta) = cast_suffix::<EntryMeta>(data);
-
-    if meta.magic.get() != EntryMeta::EXPECTED_MAGIC {
-        return Err(ReadError::BadMagic(sector));
-    }
-    let submeta_start = data.len().checked_sub(usize::from(meta.sub_bytes))
-        .ok_or(ReadError::BadSubBytes(sector))?;
-    let submeta = &data[submeta_start..];
-
-    let meta_bytes = size_of::<EntryMeta>() as u32
-        + u32::from(meta.sub_bytes);
-
-    let entry_length = 2 * meta_bytes + meta.contents_length.get();
-    let next_trailer = sector
-        .checked_sub(bytes_to_sectors::<F>(entry_length))
-        .ok_or(ReadError::BadLength(sector))?;
-    let next_sector = next_trailer + 1;
-
-    Ok(EntryInfo {
-        next_sector,
-        meta,
-        submeta,
-    })
-}
-
-pub fn read_contents<F: Flash>(
-    flash: &mut F,
-    buffer: &mut F::Sector,
-    current: Space,
-    head_sector: u32,
-    offset: u32,
-    out: &mut [u8],
-) -> Result<usize, ReadError<F::Error>> {
-    let entry = read_entry_from_head(
-        flash,
-        buffer,
-        current,
-        head_sector,
-    )?;
-    let value_offset = size_of::<EntryMeta>()
-        + size_of::<DataSubMeta>()
-        + offset as usize;
-    assert!(offset <= entry.meta.contents_length.get(),
-        "can't read at offset {offset} into data of size {}",
-        entry.meta.contents_length.get());
-    let value_len = entry.meta.contents_length.get() as usize
-        - offset as usize;
-    let value_len = value_len.min(out.len());
-
-    let mut sector = value_offset / size_of::<F::Sector>()
-        + head_sector as usize;
-    let mut offset = value_offset % size_of::<F::Sector>();
-    let mut out = &mut out[..value_len];
-
-    while offset >= size_of::<F::Sector>() {
-        offset -= size_of::<F::Sector>();
-        sector += 1;
-    }
-
-    while !out.is_empty() {
-        flash.read_sector(
-            current,
-            sector as u32,
-            buffer,
-        )?;
-
-        let n = (size_of::<F::Sector>() - offset).min(value_len);
-        out[..n].copy_from_slice(&(*buffer).borrow()[offset..offset + n]);
-        offset = 0;
-        sector += 1;
-        out = &mut out[n..];
-    }
-
-    Ok(value_len)
-}
-
-pub fn read_entry_from_head<'b, F: Flash>(
-    flash: &F,
-    buffer: &'b mut F::Sector,
-    current: Space,
-    sector: u32,
-) -> Result<EntryInfo<'b>, ReadError<F::Error>> {
-    flash.read_sector(current, sector, buffer)?;
-    let data = (*buffer).borrow();
-    let (meta, data) = cast_prefix::<EntryMeta>(data);
-
-    if meta.magic.get() != EntryMeta::EXPECTED_MAGIC {
-        return Err(ReadError::BadMagic(sector));
-    }
-    let submeta = data.get(..usize::from(meta.sub_bytes))
-        .ok_or(ReadError::BadSubBytes(sector))?;
-
-    let meta_bytes = size_of::<EntryMeta>() as u32
-        + u32::from(meta.sub_bytes);
-
-    let entry_length = 2 * meta_bytes + meta.contents_length.get();
-    let next_sector = sector.checked_add(bytes_to_sectors::<F>(entry_length))
-        .ok_or(ReadError::BadLength(sector))?;
-
-    Ok(EntryInfo {
-        next_sector,
-        meta,
-        submeta,
-    })
-}
-
-pub(crate) fn write_kv<F: Flash>(
-    flash: &mut F,
-    buffer: &mut F::Sector,
-    current: Space,
-    start_sector: u32,
-    key: &[u8],
-    value: &[u8],
-) -> Result<u32, WriteError<F::Error>> {
-    let key_len = u32::try_from(key.len())
-        .expect("key too long");
-    let value_len = u32::try_from(value.len())
-        .expect("value too long");
-    let contents_length = key_len.checked_add(value_len)
-        .expect("key+value too long");
-
-    let header = EntryMeta {
-        magic: EntryMeta::EXPECTED_MAGIC.into(),
-        subtype: KnownSubtypes::Data as u8,
-        sub_bytes: DataSubMeta::SUB_BYTES,
-        contents_length: contents_length.into(),
-    };
-    let subheader = DataSubMeta {
-        key_length: key_len.into(),
-        key_hash: hash_key(key).into(),
-    };
-
-    write_entry(
-        flash,
-        buffer,
-        current,
-        start_sector,
-        &[
-            header.as_bytes(),
-            subheader.as_bytes(),
-            key,
-            value,
-        ],
-        subheader.as_bytes(),
-        header.as_bytes(),
-    )
-}
-
-pub(crate) fn write_entry<F: Flash>(
-    flash: &mut F,
-    buffer: &mut F::Sector,
-    current: Space,
-    start_sector: u32,
-    pieces: &[&[u8]],
-    subtrailer: &[u8],
-    trailer: &[u8],
-) -> Result<u32, WriteError<F::Error>> {
-    let total_length = pieces.iter().map(|p| p.len()).sum::<usize>()
-        + subtrailer.len()
-        + trailer.len();
-    let total_length = u32::try_from(total_length).unwrap();
-    let total_sectors = bytes_to_sectors::<F>(total_length);
-    if flash.sectors_per_space() - start_sector < total_sectors {
-        return Err(WriteError::NoSpace);
-    }
-
-    let mut sector = start_sector;
-    let mut data = buffer.borrow_mut();
-    for mut piece in pieces.iter().cloned() {
-        while !piece.is_empty() {
-            let n = usize::min(piece.len(), data.len());
-            let (piece0, piece1) = piece.split_at(n);
-            let (data0, data1) = data.split_at_mut(n);
-            data0.copy_from_slice(piece0);
-            piece = piece1;
-            data = data1;
-
-            if data.is_empty() {
-                drop(data);
-
-                flash.program_sector(current, sector, buffer)?;
-                sector += 1;
-
-                data = buffer.borrow_mut();
-            }
-        }
-    }
-
-    if data.len() < subtrailer.len() + trailer.len() {
-        // We have to burn a sector on the trailer. Flush the data, but
-        // zero-fill the end of the buffer first.
-        data.fill(0);
-        drop(data);
-
-        flash.program_sector(current, sector, buffer)?;
-        sector += 1;
-
-        data = buffer.borrow_mut();
-    }
-
-    {
-        // Split remaining sector tail into unused area, which will be filled
-        // with padding, and the trailer part.
-        let dl = data.len();
-        let unused = dl - trailer.len() - subtrailer.len();
-        let (pad, tail) = data.split_at_mut(unused);
-        pad.fill(0);
-
-        let (sub, tail) = tail.split_at_mut(subtrailer.len());
-        sub.copy_from_slice(subtrailer);
-        tail.copy_from_slice(trailer);
-    }
-    drop(data);
-
-    flash.program_sector(current, sector, buffer)?;
-
-    Ok(sector + 1)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum WriteError<E> {
-    NoSpace,
-    Flash(E),
-}
-
-impl<E> From<E> for WriteError<E> {
-    fn from(e: E) -> Self {
-        Self::Flash(e)
-    }
-}
-
+/// On success, the space opposite to `from_space` contains a log that is
+/// semantically equivalent to the one in `from_space`, but with all redundant
+/// entries removed, and the generation counter advanced by 1. This function
+/// returns the watermark for that new log.
+///
+/// Failures may be `ReadError` indicating a problem processing the `from_space`
+/// log, or errors from the underlying flash device indicating problems writing
+/// the new log.
+///
+/// This function takes care to write the new space header _last,_ ensuring that
+/// the destination space will only `check` as a valid log if all writes have
+/// completed. Any failure should leave the destination space in the `Erased` or
+/// `PartiallyErased` state where it can be erased and attempted again if
+/// necessary.
+///
+/// TODO: this implementation is currently O(n^2) as it doesn't use any kind of
+/// cache to track which entries have been evacuated, requiring a scan of
+/// to-space any time a data entry is copied. This could be fixed by giving it
+/// more RAM to track copies.
 pub fn evacuate<F: Flash>(
     flash: &mut F,
     buffer0: &mut F::Sector,
     buffer1: &mut F::Sector,
     from_space: Space,
     watermark: u32,
-) -> Result<(), ReadError<F::Error>> {
+) -> Result<u32, ReadError<F::Error>> {
     flash.read_sector(from_space, 0, buffer0)?;
     let (space_header, _) = cast_prefix::<SpaceHeader>((*buffer0).borrow());
     let from_generation = space_header.generation.get();
@@ -1194,39 +1469,7 @@ pub fn evacuate<F: Flash>(
 
     flash.program_sector(to_space, 0, buffer0)?;
 
-    Ok(())
-}
-
-pub fn cast_prefix<T>(bytes: &[u8]) -> (&T, &[u8])
-    where T: FromBytes + Unaligned,
-{
-    let (lv, rest) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_prefix(bytes)
-        .expect("type does not fit in sector");
-    (lv.into_ref(), rest)
-}
-
-fn cast_prefix_mut<T>(bytes: &mut [u8]) -> (&mut T, &mut [u8])
-    where T: AsBytes + FromBytes + Unaligned,
-{
-    let (lv, rest) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_prefix(bytes)
-        .expect("type does not fit in sector");
-    (lv.into_mut(), rest)
-}
-
-fn cast_suffix<T>(bytes: &[u8]) -> (&[u8], &T)
-    where T: FromBytes + Unaligned,
-{
-    let (rest, lv) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_suffix(bytes)
-        .expect("type does not fit in sector");
-    (rest, lv.into_ref())
-}
-
-pub(crate) fn cast_suffix_mut<T>(bytes: &mut [u8]) -> (&mut [u8], &mut T)
-    where T: AsBytes + FromBytes + Unaligned,
-{
-    let (rest, lv) = zerocopy::LayoutVerified::<_, T>::new_unaligned_from_suffix(bytes)
-        .expect("type does not fit in sector");
-    (rest, lv.into_mut())
+    Ok(to_sector)
 }
 
 #[cfg(test)]
@@ -1582,8 +1825,7 @@ mod tests {
         format(&mut flash, &mut buffer, Space::Zero, G)
             .expect("format should succeed");
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::ValidLog {
@@ -1607,8 +1849,7 @@ mod tests {
             .expect("write should succeed");
         assert_eq!(end_of_entry, 1 + 3);
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::ValidLog {
@@ -1634,8 +1875,7 @@ mod tests {
                 .expect("write should succeed");
         }
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::ValidLog {
@@ -1664,8 +1904,7 @@ mod tests {
         let final_result = write_kv(&mut flash, &mut buffer, Space::Zero, p, b"hi", b"there");
         assert_eq!(Err(WriteError::NoSpace), final_result);
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::ValidLog {
@@ -1692,13 +1931,12 @@ mod tests {
             flash.erase_sector(Space::Zero, s);
         }
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::ValidLog {
             generation: G,
-            end: 1 + 3,
+            end: 1, // does not include incomplete entry
             tail_erased: true,
             incomplete_write: true, // <-- the point
         });
@@ -1718,8 +1956,7 @@ mod tests {
         // Sneakily program a sector after the entry.
         flash.program_sector(Space::Zero, end_of_entry + 2, &[0; 16]).unwrap();
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::ValidLog {
@@ -1745,8 +1982,7 @@ mod tests {
         // Nuke the central data sector.
         flash.erase_sector(Space::Zero, 2);
 
-        let mut buffer1 = [0; 16];
-        let result = check(&mut flash, &mut buffer, &mut buffer1, Space::Zero)
+        let result = check(&mut flash, &mut buffer, Space::Zero)
             .expect("check should not fail");
 
         assert_eq!(result, CheckResult::Bad(CheckError::UnprogrammedData(1)));
