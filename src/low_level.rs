@@ -374,16 +374,9 @@ pub trait Flash {
             self.read_sector(space0, sector0, buffer0)?;
             self.read_sector(space1, sector1, buffer1)?;
             let n = length.min(size_of::<Self::Sector>() as u32);
-            #[cfg(test)]
-            println!("comparing:\n{:x?}\n{:x?}",
-                &(*buffer0).borrow()[..n as usize],
-                &(*buffer1).borrow()[..n as usize],
-            );
             if (*buffer0).borrow()[..n as usize] != (*buffer1).borrow()[..n as usize] {
                 return Ok(false);
             }
-            #[cfg(test)]
-            println!("equal");
             sector0 += 1;
             sector1 += 1;
             length -= n;
