@@ -133,6 +133,23 @@ pub struct EntryMeta {
 impl EntryMeta {
     /// Bits we expect to find in the `magic` field.
     pub const EXPECTED_MAGIC: u16 = 0xCB_F5;
+
+    /// Number of bytes in the full header/trailer including both this and the
+    /// associated sub-meta.
+    pub fn meta_length(&self) -> usize {
+        size_of::<Self>() + usize::from(self.sub_bytes)
+    }
+
+    /// Number of bytes in the entire entry this record describes, without
+    /// padding for sector alignment.
+    pub fn unpadded_entry_length(&self) -> usize {
+        2 * self.meta_length() + self.contents_length.get() as usize
+    }
+
+    /// Number of sectors in the entire entry this record describes.
+    pub fn entry_sectors<F: Flash>(&self) -> u32 {
+        bytes_to_sectors::<F>(self.unpadded_entry_length() as u32)
+    }
 }
 
 /// Defined values for the `EntryMeta::subtype` field.
@@ -450,11 +467,7 @@ pub fn read_entry_from_head<'b, F: Flash>(
     let submeta = data.get(..usize::from(meta.sub_bytes))
         .ok_or(ReadError::BadSubBytes(sector))?;
 
-    let meta_bytes = size_of::<EntryMeta>() as u32
-        + u32::from(meta.sub_bytes);
-
-    let entry_length = 2 * meta_bytes + meta.contents_length.get();
-    let next_sector = sector.checked_add(bytes_to_sectors::<F>(entry_length))
+    let next_sector = sector.checked_add(meta.entry_sectors::<F>())
         .ok_or(ReadError::BadLength(sector))?;
 
     Ok(EntryInfo {
@@ -529,12 +542,8 @@ pub(crate) fn read_entry_from_tail<'b, F: Flash>(
         .ok_or(ReadError::BadSubBytes(sector))?;
     let submeta = &data[submeta_start..];
 
-    let meta_bytes = size_of::<EntryMeta>() as u32
-        + u32::from(meta.sub_bytes);
-
-    let entry_length = 2 * meta_bytes + meta.contents_length.get();
     let next_trailer = sector
-        .checked_sub(bytes_to_sectors::<F>(entry_length))
+        .checked_sub(meta.entry_sectors::<F>())
         .ok_or(ReadError::BadLength(sector))?;
     let next_sector = next_trailer + 1;
 
@@ -1366,11 +1375,8 @@ pub fn evacuate<F: Flash>(
     while from_sector > header_sectors {
         let entry = read_entry_from_tail(flash, buffer0, from_space, from_sector)?;
 
-        let meta_bytes = size_of::<EntryMeta>() as u32
-            + u32::from(entry.meta.sub_bytes);
-        let entry_bytes = 2 * meta_bytes
-            + entry.meta.contents_length.get();
-        let entry_sectors = bytes_to_sectors::<F>(entry_bytes);
+        let meta_bytes = entry.meta.meta_length();
+        let entry_sectors = entry.meta.entry_sectors::<F>();
 
         let head_sector = entry.next_sector;
 
@@ -1406,7 +1412,7 @@ pub fn evacuate<F: Flash>(
                                         head_sector,
                                         to_space,
                                         s,
-                                        key_len + meta_bytes,
+                                        key_len + meta_bytes as u32,
                                         buf,
                                         buffer1,
                                     )?;
